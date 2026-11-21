@@ -670,6 +670,35 @@ fn reports_cover_scans_and_a_summary() {
 }
 
 #[test]
+fn closed_stdout_ends_quietly() {
+    let env = Env::new();
+    env.init();
+    insert_alert(&env, "/tmp/x");
+    for args in [
+        vec!["config", "default"],
+        vec!["rules", "list"],
+        vec!["--json", "rules", "list"],
+        vec!["alerts", "show", "1"],
+        vec!["alerts", "export", "--format", "text"],
+    ] {
+        // A pipe whose reader is already gone, as after `| head` exits.
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        let out = StdCommand::new(assert_cmd::cargo::cargo_bin("soteria"))
+            .args(&args)
+            .env("SOTERIA_CONFIG", &env.config)
+            .env("NO_COLOR", "1")
+            .stdout(writer)
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(141), "{args:?}: {stderr}");
+        assert!(stderr.is_empty(), "{args:?}: {stderr}");
+    }
+}
+
+#[test]
 fn rules_list_show_and_validate() {
     let env = Env::new();
     env.init();

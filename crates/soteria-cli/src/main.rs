@@ -1,5 +1,25 @@
 //! `soteria`: CLI and daemon entry point (SRS 6, 8.1).
 
+/// `print!` and `println!` for this crate: like std's, but when stdout is
+/// closed (`soteria alerts list | head`) the process ends quietly with the
+/// status a shell reports for SIGPIPE (141), as other Unix tools do,
+/// instead of panicking. Defined before the modules so it shadows std's in
+/// all of them.
+macro_rules! print {
+    ($($arg:tt)*) => {
+        $crate::output::write_stdout(format_args!($($arg)*))
+    };
+}
+
+macro_rules! println {
+    () => {
+        $crate::output::write_stdout(format_args!("\n"))
+    };
+    ($($arg:tt)*) => {
+        $crate::output::write_stdout(format_args!("{}\n", format_args!($($arg)*)))
+    };
+}
+
 mod cli;
 mod cmd;
 mod context;
