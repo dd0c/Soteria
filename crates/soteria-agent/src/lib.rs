@@ -11,6 +11,7 @@ pub mod exec;
 mod exec_sensor;
 pub mod incidents;
 pub mod lifecycle;
+pub mod retention;
 pub mod rules;
 
 use std::collections::HashMap;
@@ -38,6 +39,11 @@ use soteria_store::{Store, now};
 use tracing::{error, info, warn};
 
 use alerts::{NewAlert, Policy, Raised, Source};
+
+/// How often old events and execution records are deleted.
+const RETENTION_INTERVAL: Duration = Duration::from_secs(3600);
+/// Delay before the first retention run after start.
+const RETENTION_FIRST: Duration = Duration::from_secs(300);
 
 /// Meta key holding the agent's latest health snapshot (FR-039).
 pub const HEALTH_KEY: &str = "agent_health";
@@ -151,6 +157,8 @@ pub struct Agent {
     spare_monitor: Option<exec::ExecMonitor>,
     /// Detection rules in effect (built-in, overrides, administrator rules).
     rules: Arc<RuleSet>,
+    /// When old events and execution records are next deleted.
+    next_retention: Instant,
 }
 
 impl Agent {
@@ -169,6 +177,8 @@ impl Agent {
         let startup_scan = options.startup_scan && config.scanning.startup_scan;
         let mut agent = Agent {
             rules,
+            // Not at once: the startup scan comes first.
+            next_retention: now_i + RETENTION_FIRST,
             next_full: if startup_scan {
                 now_i
             } else {
@@ -388,7 +398,25 @@ impl Agent {
             self.store.connection(),
             self.config.alerts.correlation_window.0,
         )?;
+        if Instant::now() >= self.next_retention {
+            self.prune()?;
+        }
         Ok(())
+    }
+
+    /// Delete events and execution records past the retention period.
+    pub fn prune(&mut self) -> Result<retention::Pruned> {
+        let days = u64::from(self.config.general.event_retention_days);
+        let pruned = retention::prune(self.store.connection(), Duration::from_secs(days * 86_400))?;
+        if pruned != retention::Pruned::default() {
+            info!(
+                events = pruned.events,
+                processes = pruned.processes,
+                "deleted records older than {days} days"
+            );
+        }
+        self.next_retention = Instant::now() + RETENTION_INTERVAL;
+        Ok(pruned)
     }
 
     /// Verify every pending path now, regardless of settle time.
