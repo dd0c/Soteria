@@ -15,7 +15,7 @@ use std::process::ExitCode;
 use clap::Parser;
 
 use cli::{Cli, Command};
-use cmd::unavailable::{self, DETECTION, EXECUTION};
+use cmd::unavailable::{self, DETECTION};
 use output::{CmdResult, Output};
 
 fn main() -> ExitCode {
@@ -50,7 +50,7 @@ fn dispatch(cli: &Cli, out: &Output) -> CmdResult {
         Command::Baseline(c) => cmd::baseline::run(c, g, out),
         Command::Inventory(args) => cmd::inventory::run(args, g, out),
         Command::Events(args) => cmd::events::run(args, g, out),
-        Command::Processes(_) => unavailable::run("processes", EXECUTION),
+        Command::Processes(args) => cmd::processes::run(args, g, out),
         Command::Alerts(c) => cmd::alerts::run(c, g, out),
         Command::Rules(_) => unavailable::run("rules", DETECTION),
         Command::Report(_) => unavailable::run("report", DETECTION),

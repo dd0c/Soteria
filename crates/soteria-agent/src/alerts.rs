@@ -1,4 +1,5 @@
-//! Integrity alerts (FR-021, FR-028, FR-029).
+//! Alerts (FR-021, FR-028, FR-029): integrity alerts here, execution
+//! alerts in [`crate::exec`].
 //!
 //! Every alert carries the rule that fired, a plain-language reason, the
 //! approved and current state, and investigation guidance. Alerts are
@@ -176,39 +177,101 @@ pub enum Raised {
     BelowThreshold,
 }
 
-/// Record an alert for a baseline deviation, unless it is a duplicate or
-/// below `minimum`.
-pub fn raise(conn: &Connection, a: &NewAlert<'_>, minimum: Severity) -> rusqlite::Result<Raised> {
-    let c = a.change;
-    if c.severity < minimum {
+/// Any alert, before de-duplication and threshold checks.
+pub struct AlertSpec<'a> {
+    pub alert_type: &'a str,
+    pub rule_id: &'a str,
+    pub severity: Severity,
+    pub hostname: &'a str,
+    pub object: &'a str,
+    pub reason: &'a str,
+    pub recommendation: &'a str,
+    /// Evidence; a `fingerprint` field is added.
+    pub evidence: Value,
+    /// What makes two detections "the same" for de-duplication, together
+    /// with the object and rule.
+    pub identity: Value,
+    pub event_id: Option<i64>,
+}
+
+/// Record an alert unless it is below `minimum` or an unresolved alert for
+/// the same object, rule and identity exists.
+pub fn insert(conn: &Connection, a: AlertSpec<'_>, minimum: Severity) -> rusqlite::Result<Raised> {
+    if a.severity < minimum {
         return Ok(Raised::BelowThreshold);
     }
-    let kind = primary(&c.kinds);
-    let rule = rule_for(kind);
-    let object = String::from_utf8_lossy(c.path.as_os_str().as_bytes()).into_owned();
-    let before = c.before.as_ref().map(state_json);
-    let after = c.after.as_ref().map(state_json);
-    // Identity of the deviation: same object, rule and resulting state.
     let fingerprint = sha256_hex(
-        json!({ "object": object, "rule": rule.id, "after": after })
+        json!({ "object": a.object, "rule": a.rule_id, "after": a.identity })
             .to_string()
             .as_bytes(),
     );
-
     let existing: Option<i64> = conn
         .query_row(
             &format!(
                 "SELECT id FROM alerts WHERE object = ?1 AND rule_id = ?2 AND status IN {UNRESOLVED}
                  AND json_extract(evidence, '$.fingerprint') = ?3 LIMIT 1"
             ),
-            params![object, rule.id, fingerprint],
+            params![a.object, a.rule_id, fingerprint],
             |r| r.get(0),
         )
         .optional()?;
     if let Some(id) = existing {
         return Ok(Raised::Duplicate { id });
     }
+    let mut evidence = a.evidence;
+    if let Some(map) = evidence.as_object_mut() {
+        map.insert("fingerprint".into(), Value::String(fingerprint));
+    }
+    let ts = now();
+    let uuid = new_id();
+    // A savepoint, so this also works inside a caller's transaction.
+    conn.execute_batch("SAVEPOINT raise_alert")?;
+    let result = (|| -> rusqlite::Result<i64> {
+        conn.execute(
+        "INSERT INTO alerts (uuid, created_at, updated_at, severity, type, status, hostname, object,
+                             rule_id, reason, evidence, recommendation, event_id)
+         VALUES (?1, ?2, ?2, ?3, ?4, 'open', ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            uuid,
+            ts,
+            a.severity.as_str(),
+            a.alert_type,
+            a.hostname,
+            a.object,
+            a.rule_id,
+            a.reason,
+            evidence.to_string(),
+            a.recommendation,
+            a.event_id
+        ],
+    )?;
+        let id = conn.last_insert_rowid();
+        conn.execute(
+        "INSERT INTO alert_history (alert_id, ts, actor, action, to_status) VALUES (?1, ?2, 'soteria', 'created', 'open')",
+        params![id, ts],
+    )?;
+        Ok(id)
+    })();
+    match result {
+        Ok(id) => {
+            conn.execute_batch("RELEASE raise_alert")?;
+            Ok(Raised::Created { id, uuid })
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK TO raise_alert; RELEASE raise_alert");
+            Err(e)
+        }
+    }
+}
 
+/// Record an alert for a baseline deviation, unless it is a duplicate or
+/// below `minimum`.
+pub fn raise(conn: &Connection, a: &NewAlert<'_>, minimum: Severity) -> rusqlite::Result<Raised> {
+    let c = a.change;
+    let rule = rule_for(primary(&c.kinds));
+    let object = String::from_utf8_lossy(c.path.as_os_str().as_bytes()).into_owned();
+    let before = c.before.as_ref().map(state_json);
+    let after = c.after.as_ref().map(state_json);
     let kinds: Vec<&str> = c.kinds.iter().map(|k| k.as_str()).collect();
     let reason = if c.kinds.len() > 1 {
         format!("{} Also changed: {}.", rule.reason, kinds.join(", "))
@@ -216,40 +279,29 @@ pub fn raise(conn: &Connection, a: &NewAlert<'_>, minimum: Severity) -> rusqlite
         rule.reason.to_owned()
     };
     let evidence = json!({
-        "fingerprint": fingerprint,
         "source": a.source.as_str(),
         "baseline_version": a.baseline_version,
         "changes": kinds,
         "baseline": before,
         "current": after,
-        "actor": "unknown: filesystem events do not identify the process; execution telemetry arrives in a later release",
+        "actor": "unknown: filesystem events do not identify the process",
     });
-    let ts = now();
-    let uuid = new_id();
-    let tx = conn.unchecked_transaction()?;
-    tx.execute(
-        "INSERT INTO alerts (uuid, created_at, updated_at, severity, type, status, hostname, object,
-                             rule_id, reason, evidence, recommendation)
-         VALUES (?1, ?2, ?2, ?3, 'file_integrity', 'open', ?4, ?5, ?6, ?7, ?8, ?9)",
-        params![
-            uuid,
-            ts,
-            c.severity.as_str(),
-            a.hostname,
-            object,
-            rule.id,
-            reason,
-            evidence.to_string(),
-            rule.recommendation
-        ],
-    )?;
-    let id = tx.last_insert_rowid();
-    tx.execute(
-        "INSERT INTO alert_history (alert_id, ts, actor, action, to_status) VALUES (?1, ?2, 'soteria', 'created', 'open')",
-        params![id, ts],
-    )?;
-    tx.commit()?;
-    Ok(Raised::Created { id, uuid })
+    insert(
+        conn,
+        AlertSpec {
+            alert_type: "file_integrity",
+            rule_id: rule.id,
+            severity: c.severity,
+            hostname: a.hostname,
+            object: &object,
+            reason: &reason,
+            recommendation: rule.recommendation,
+            evidence,
+            identity: after.unwrap_or(Value::Null),
+            event_id: None,
+        },
+        minimum,
+    )
 }
 
 /// Record a raw event (sensor observation or system activity).

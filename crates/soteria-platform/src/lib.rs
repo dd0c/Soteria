@@ -430,11 +430,9 @@ impl Platform {
             _ => Probe::available("mac", mac.to_string()),
         });
 
-        probes.push(if self.root.exists("/proc/self/loginuid") {
-            Probe::available(
-                "audit",
-                "kernel audit support present (sensor arrives in a later release)",
-            )
+        let kernel_audit = self.root.exists("/proc/self/loginuid");
+        probes.push(if kernel_audit {
+            Probe::available("audit", "kernel audit support present")
         } else {
             Probe::unavailable(
                 "audit",
@@ -442,9 +440,51 @@ impl Platform {
             )
         });
 
+        // The execve audit rule ships as a rules file that auditd loads.
+        if kernel_audit {
+            let auditd = ["/usr/sbin/auditd", "/sbin/auditd"]
+                .iter()
+                .any(|p| self.root.exists(p));
+            let rules = self.root.path(AUDIT_RULES_FILE).try_exists();
+            probes.push(match (auditd, rules) {
+                (false, _) => Probe::unavailable(
+                    "audit_rule",
+                    format!(
+                        "auditd is not installed, so the execve audit rule ({AUDIT_RULES_FILE}) is not loaded; install it ({})",
+                        self.install_hint()
+                    ),
+                ),
+                (true, Ok(true)) => Probe::available(
+                    "audit_rule",
+                    format!("auditd installed; {AUDIT_RULES_FILE} present"),
+                ),
+                (true, Ok(false)) => Probe::unavailable(
+                    "audit_rule",
+                    format!("{AUDIT_RULES_FILE} is missing; execution events will not be reported"),
+                ),
+                (true, Err(_)) => Probe::unknown(
+                    "audit_rule",
+                    format!("auditd installed; cannot check {AUDIT_RULES_FILE} without root"),
+                ),
+            });
+        }
+
         probes
     }
 }
+
+impl Platform {
+    fn install_hint(&self) -> &'static str {
+        match self.adapter.family() {
+            Family::Rhel => "dnf install audit",
+            Family::Debian => "apt install auditd",
+            Family::Unknown => "install the auditd package",
+        }
+    }
+}
+
+/// Audit rules file that asks the kernel to report executions (FR-009).
+pub const AUDIT_RULES_FILE: &str = "/etc/audit/rules.d/soteria.rules";
 
 fn support_level(supported: bool) -> SupportLevel {
     if supported {

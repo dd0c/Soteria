@@ -1,0 +1,14 @@
+## Soteria execution monitoring (FR-009).
+##
+## Installed as /etc/audit/rules.d/soteria.rules and loaded by auditd
+## (augenrules). It asks the kernel to report every successful program
+## execution; Soteria reads these events from the audit multicast stream
+## with CAP_AUDIT_READ and never changes audit rules itself.
+##
+## auditd also writes these events to its own log (/var/log/audit), which
+## grows with the number of executions; size it with max_log_file and
+## num_logs in /etc/audit/auditd.conf.
+-a always,exit -F arch=b64 -S execve,execveat -F success=1 -F key=soteria_exec
+## 32-bit programs use a separate system call table; without this rule they
+## would run unseen on 64-bit hosts that support them.
+-a always,exit -F arch=b32 -S execve,execveat -F success=1 -F key=soteria_exec

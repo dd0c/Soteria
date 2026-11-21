@@ -18,7 +18,7 @@ traits in `soteria-platform` (SRS 5.3, 4.7).
 | `soteria-store` | storage layer | SQLite schema, versioned transactional migrations, repositories, retention, integrity checks (5.6) |
 | `soteria-inventory` | inventory engine | Discovery, classification, metadata, SHA-256 hashing (FR-001..004) |
 | `soteria-integrity` | integrity engine | Baseline build, review, approval, sealing, verification, comparison, version history (FR-005..008, FR-044) |
-| `soteria-sensors` | filesystem, execution, system sensors | fanotify/inotify, Linux Audit execution sensor, account/service/persistence/kernel/boot observers |
+| `soteria-sensors` | filesystem, execution, system sensors | inotify, Linux Audit execution sensor, account/service/persistence/kernel/boot observers |
 | `soteria-detect` | detection + correlation | Rule engine, severity, execution classification, correlation into incidents |
 | `soteria-agent` | core agent, alert manager, health monitor | Daemon lifecycle, bounded queues, scheduler, alert lifecycle, notifications, health status, local IPC |
 | `soteria` (bin) | CLI | Clap CLI, text/JSON output, exit codes; `soteria daemon` runs the agent |
@@ -37,13 +37,13 @@ cannot do.
 |---|---|---|---|---|
 | M1 | Foundation | 1 | FR-040..043, 5.6, 8.3, 4.6 | Workspace, CLI with all 12 subcommands (help, `--json`, exit codes), config load/validate, platform detection, SQLite schema v1 with migrations, systemd unit, CI (fmt, clippy, tests) |
 | M2 | Inventory and baseline | 2 | FR-001..008, FR-033/034, FR-044, 10.3 | Discovery, classification, metadata (caps, SELinux/AppArmor labels), SHA-256, `init`, `inventory`, `scan`, `baseline create/review/approve/diff/list`, sealed baselines, `verify baseline` |
-| M3 | Integrity monitoring | 3 | FR-014..017, FR-032, FR-036..039, NFR-006 | Daemon, fanotify with inotify fallback, bounded queues, event re-verification, scheduled reconciliation, coverage gaps, integrity alerts, `status`, health |
+| M3 | Integrity monitoring | 3 | FR-014..017, FR-032, FR-036..039, NFR-006 | Daemon, inotify filesystem sensor, bounded queues, event re-verification, scheduled reconciliation, coverage gaps, integrity alerts, `status`, health |
 | M4 | Execution monitoring | 4 | FR-009..013 | Audit netlink execution sensor, process records, classification, unusual-location detection, lineage, `processes` search |
 | M5 | Detection and incidents | 5 | FR-018, FR-021, FR-028..031, FR-035 | TOML rule engine, severity, correlation, alert lifecycle (ack, investigated, notes, suppress), retention, JSON/CSV/text export, journald/email/webhook notifications |
 | M6 | System monitoring and hardening | 6 | FR-019/020, FR-022..027, NFR-008..016 | Config, persistence, account, kernel/boot monitoring, self-integrity, privileged helper with authenticated IPC, SELinux policy module, AppArmor profile, systemd hardening |
 | M7 | Packaging and release | 7 | 9, 11, 12, 13 | RPM (RHEL 9/10), DEB (Debian 13), install/upgrade/remove scripts, container-based test matrix, benchmarks, admin documentation |
 
-Progress: M1 and M2 merged (PRs #1, #2). M3 in review.
+Progress: M1 to M3 merged (PRs #1 to #3). M4 in review.
 
 ## Key design choices (proposed)
 
@@ -56,13 +56,15 @@ Progress: M1 and M2 merged (PRs #1, #2). M3 in review.
   Approval (`sudo soteria baseline approve`) signs; the daemon holds only the
   public key and verifies. A compromised `soteria` account therefore cannot
   forge a baseline, though local root still can (SRS 10.2).
-- **Execution sensor (FR-009):** subscribe to the kernel audit multicast group
-  over netlink (`CAP_AUDIT_READ`). This coexists with `auditd` instead of
-  replacing it, and needs no log parsing.
-- **Filesystem sensor (FR-014):** fanotify with `FAN_REPORT_FID`-style
-  directory events where the kernel and privileges allow it, inotify otherwise.
-  Whichever is active is reported in `status`/`verify`, and queue overflow
-  becomes a coverage gap plus a forced reconciliation scan.
+- **Execution sensor (FR-009), decided:** subscribe to the kernel audit
+  multicast group over netlink (`CAP_AUDIT_READ`). This coexists with
+  `auditd` instead of replacing it, and needs no log parsing. The execve
+  audit rule ships as `/etc/audit/rules.d/soteria.rules` and is loaded by
+  auditd; Soteria never changes audit rules itself.
+- **Filesystem sensor (FR-014), decided:** inotify only. It works for the
+  unprivileged daemon; fanotify would need `CAP_SYS_ADMIN` and is not used.
+  Unwatchable directories and queue overflow become coverage gaps, and
+  overflow forces a reconciliation scan.
 - **Rules (FR-021, 4.6):** built-in rules ship in the binary; administrator
   rules live in `/etc/soteria/rules.d/*.toml`, separate from sensors.
 - **Exit codes (FR-042):** `0` OK, `1` findings present (alerts/changes),
@@ -71,7 +73,7 @@ Progress: M1 and M2 merged (PRs #1, #2). M3 in review.
   platform or build, `10` internal error. See [CLI.md](CLI.md).
 - **Privilege (5.4):** daemon runs as `soteria` with
   `AmbientCapabilities=CAP_DAC_READ_SEARCH CAP_AUDIT_READ`; anything more
-  (fanotify needs `CAP_SYS_ADMIN`) goes through the M6 helper. Until then,
+  goes through the M6 helper. Until then,
   missing capabilities are reported as coverage gaps, not hidden.
 
 ## Additions and interpretations of the SRS
@@ -91,12 +93,12 @@ Progress: M1 and M2 merged (PRs #1, #2). M3 in review.
    any other difference as `metadata_modified` at `info` severity.
 7. Change severities in M2 are fixed defaults; the M5 rule engine makes them
    configurable (FR-021).
-8. M3 uses inotify only. fanotify needs `CAP_SYS_ADMIN`, which the service
-   does not hold; it moves to M6 with the privileged helper. inotify does not
-   identify the process that made a change, so integrity alerts record the
-   actor as unknown until execution telemetry (M4) can be correlated (M5).
-9. Monitors enabled in the configuration but not built yet (execution,
-   kernel, persistence, users) are reported as `unavailable` sensors, which
+8. The filesystem sensor is inotify only (decided 2026-11-21); fanotify
+   would need `CAP_SYS_ADMIN`. inotify does not identify the process that
+   made a change, so integrity alerts record the actor as unknown until
+   execution telemetry (M4) can be correlated (M5).
+9. Monitors enabled in the configuration but not built yet (kernel,
+   persistence, users) are reported as `unavailable` sensors, which
    keeps protection at `DEGRADED` instead of `ACTIVE` (SRS 4.7).
 10. Scans record `file.created/modified/deleted` events (sensor `scanner`) for
     changes they find, so the event history includes changes no live event
@@ -104,3 +106,18 @@ Progress: M1 and M2 merged (PRs #1, #2). M3 in review.
 11. A full scan holds the database for its duration, so status treats a
     recent running scan as liveness, and the systemd watchdog is fed by a
     separate thread with a 30-minute stall limit.
+12. Execution monitoring needs auditd to load its rule. A self-test (the
+    agent runs `/bin/true` and looks for it in the stream) detects a
+    missing rule, since listing audit rules needs `CAP_AUDIT_CONTROL`.
+    Consequence: auditd also logs every execution to `/var/log/audit`.
+13. Classification applies to the program image the kernel loaded. When an
+    interpreter runs a script, the script is checked for unusual location
+    and recent change, but it is not hashed.
+14. Execution severities and the service and shell lists for EXE-004 are
+    built in; the M5 rule engine makes them configurable.
+15. The daemon applies pending database migrations at start, so a package
+    upgrade needs no manual step. CLI commands still refuse an outdated
+    database and point to `soteria init`.
+16. Configuration gains an `[execution]` section: argument privacy,
+    `max_argument_bytes`, `hash_max_bytes`, `unusual_paths` and
+    `recent_change`.

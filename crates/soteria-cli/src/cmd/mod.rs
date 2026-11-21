@@ -4,6 +4,7 @@ pub mod config;
 pub mod events;
 pub mod init;
 pub mod inventory;
+pub mod processes;
 pub mod scan;
 pub mod status;
 pub mod unavailable;

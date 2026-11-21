@@ -47,6 +47,7 @@ pub struct Config {
     pub monitoring: Monitoring,
     pub scanning: Scanning,
     pub paths: Paths,
+    pub execution: Execution,
     pub baseline: Baseline,
     pub alerts: Alerts,
 }
@@ -86,6 +87,59 @@ pub struct Paths {
     pub exclude: Vec<PathBuf>,
 }
 
+/// How much of a command line is stored (NFR-011).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArgumentPolicy {
+    /// Arguments as executed.
+    Full,
+    /// Values that look like secrets (passwords, tokens, keys, URL
+    /// credentials) are replaced with `[REDACTED]`.
+    Redacted,
+    /// Only the program name (argument 0).
+    None,
+}
+
+/// Execution monitoring (FR-009..FR-012).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Execution {
+    pub arguments: ArgumentPolicy,
+    /// Stored command lines are cut to this many bytes.
+    pub max_argument_bytes: usize,
+    /// Executables larger than this are not hashed.
+    pub hash_max_bytes: u64,
+    /// Locations where execution is unusual (FR-011), in addition to hidden
+    /// paths, deleted or memory-only programs, and files writable by
+    /// non-root users.
+    pub unusual_paths: Vec<PathBuf>,
+    /// A program created or changed this recently counts as new.
+    pub recent_change: HumanDuration,
+}
+
+impl Default for Execution {
+    fn default() -> Self {
+        Execution {
+            arguments: ArgumentPolicy::Redacted,
+            max_argument_bytes: 4096,
+            hash_max_bytes: 256 << 20,
+            unusual_paths: [
+                "/tmp",
+                "/var/tmp",
+                "/dev/shm",
+                "/run/user",
+                "/dev/mqueue",
+                "/home",
+                "/root",
+            ]
+            .iter()
+            .map(PathBuf::from)
+            .collect(),
+            recent_change: HumanDuration::from_secs(3600),
+        }
+    }
+}
+
 /// Baseline signing keys (FR-006). The private key is readable by root only;
 /// the daemon only needs the public key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,6 +175,7 @@ impl Default for Config {
             monitoring: Monitoring::default(),
             scanning: Scanning::default(),
             paths: Paths::default(),
+            execution: Execution::default(),
             baseline: Baseline::default(),
             alerts: Alerts::default(),
         }
@@ -449,6 +504,30 @@ impl Config {
         }
         for (i, path) in p.exclude.iter().enumerate() {
             v.absolute_path(&format!("paths.exclude[{i}]"), path);
+        }
+
+        // [execution]
+        let e = &self.execution;
+        for (i, path) in e.unusual_paths.iter().enumerate() {
+            v.absolute_path(&format!("execution.unusual_paths[{i}]"), path);
+        }
+        if e.max_argument_bytes < 64 {
+            v.error(
+                "execution.max_argument_bytes",
+                "must be at least 64 so the program name and first arguments are kept",
+            );
+        }
+        if e.arguments == ArgumentPolicy::Full {
+            v.note(
+                "execution.arguments",
+                "command lines are stored unredacted and may contain passwords or tokens",
+            );
+        }
+        if e.hash_max_bytes == 0 {
+            v.warning(
+                "execution.hash_max_bytes",
+                "executables are never hashed; every execution is classified as unverified",
+            );
         }
 
         // [baseline]

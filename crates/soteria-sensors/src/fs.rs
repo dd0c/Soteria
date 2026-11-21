@@ -1,8 +1,7 @@
 //! Filesystem sensor based on inotify (FR-014, SRS 5.5).
 //!
 //! inotify needs no privileges, so it works for the unprivileged daemon.
-//! fanotify, which can also see whole mounts, needs CAP_SYS_ADMIN and moves
-//! to the privileged helper in milestone 6.
+//! fanotify is deliberately not used: it needs CAP_SYS_ADMIN.
 //!
 //! The sensor watches every directory in scope and reports *paths* that may
 //! have changed; it does not try to interpret the change. The agent

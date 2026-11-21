@@ -7,6 +7,8 @@
 //! and runs scans that are due.
 
 pub mod alerts;
+pub mod exec;
+mod exec_sensor;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -26,6 +28,7 @@ use soteria_integrity::compare::{Change, ChangeKind, ChangeSummary, diff_record,
 use soteria_integrity::keys;
 use soteria_integrity::scan::{self, ScanTarget, delete_file, load_file, upsert_file};
 use soteria_inventory::{Scope, inspect_path};
+use soteria_sensors::audit::{self as exec_audit, AuditSnapshot};
 use soteria_sensors::fs::{self as fs_sensor, FsEvent, SensorStats, StatsSnapshot};
 use soteria_store::{Store, now};
 use tracing::{error, info, warn};
@@ -71,6 +74,9 @@ pub struct Options {
     pub max_delay: Duration,
     /// Run a full reconciliation at start (also forced by config).
     pub startup_scan: bool,
+    /// Join the kernel audit stream for executions. Tests that feed
+    /// executions directly turn it off.
+    pub exec_sensor: bool,
 }
 
 impl Default for Options {
@@ -80,6 +86,7 @@ impl Default for Options {
             settle: Duration::from_millis(250),
             max_delay: Duration::from_millis(1500),
             startup_scan: true,
+            exec_sensor: true,
         }
     }
 }
@@ -90,6 +97,9 @@ pub struct Health {
     pub updated_at: String,
     pub fs_sensor: Option<StatsSnapshot>,
     pub fs_sensor_state: String,
+    pub exec_sensor: Option<AuditSnapshot>,
+    pub exec_sensor_state: String,
+    pub executions_processed: u64,
     pub pending_paths: usize,
     pub events_processed: u64,
     pub last_event_at: Option<String>,
@@ -128,6 +138,11 @@ pub struct Agent {
     last_event_at: Option<String>,
     last_reconciliation: Option<String>,
     scan_state: String,
+    exec: Option<exec_sensor::ExecState>,
+    exec_sensor_state: String,
+    executions_processed: u64,
+    /// Execution classifier used without a live sensor (tests).
+    spare_monitor: Option<exec::ExecMonitor>,
 }
 
 impl Agent {
@@ -164,6 +179,10 @@ impl Agent {
             last_event_at: None,
             last_reconciliation: None,
             scan_state: "idle".into(),
+            exec: None,
+            exec_sensor_state: "stopped".into(),
+            executions_processed: 0,
+            spare_monitor: None,
             config,
             store,
         };
@@ -174,11 +193,6 @@ impl Agent {
         // unavailable rather than silently absent.
         let m = &agent.config.monitoring;
         let planned = [
-            (
-                "execution",
-                m.execution,
-                "execution monitoring arrives in a later release",
-            ),
             (
                 "kernel",
                 m.kernel,
@@ -208,6 +222,25 @@ impl Agent {
                 "disabled",
                 Some("disabled by configuration"),
             );
+        }
+
+        if agent.config.monitoring.execution {
+            if agent.options.exec_sensor {
+                agent.start_exec_sensor();
+            }
+        } else {
+            agent.exec_sensor_state = "disabled".into();
+            agent.health(
+                exec_audit::SENSOR,
+                "disabled",
+                Some("execution monitoring disabled by configuration"),
+            );
+            agent.open_gap(
+                "disabled",
+                exec_audit::SENSOR,
+                None,
+                "execution monitoring is disabled by configuration",
+            )?;
         }
 
         if agent.config.monitoring.file_integrity {
@@ -317,6 +350,8 @@ impl Agent {
             std::thread::sleep(budget);
         }
 
+        self.drain_exec()?;
+        self.check_exec_sensor()?;
         self.check_sensor()?;
         self.process_due()?;
 
@@ -749,6 +784,9 @@ impl Agent {
             updated_at: now(),
             fs_sensor: self.sensor.as_ref().map(|_| self.stats.snapshot()),
             fs_sensor_state: self.sensor_state.clone(),
+            exec_sensor: self.exec.as_ref().map(|e| e.stats.snapshot()),
+            exec_sensor_state: self.exec_sensor_state.clone(),
+            executions_processed: self.executions_processed,
             pending_paths: self.pending.len(),
             events_processed: self.events_processed,
             last_event_at: self.last_event_at.clone(),
@@ -781,7 +819,13 @@ impl Agent {
         if let Some(h) = self.sensor.take() {
             let _ = h.join();
         }
+        if let Some(h) = self.exec.as_mut().and_then(|e| e.sensor.take()) {
+            let _ = h.join();
+        }
         self.health(fs_sensor::SENSOR, "stopped", Some("agent shutdown"));
+        if self.exec.is_some() {
+            self.health(exec_audit::SENSOR, "stopped", Some("agent shutdown"));
+        }
     }
 }
 
