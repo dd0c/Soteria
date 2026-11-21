@@ -6,7 +6,7 @@
 //! unreachable server never holds up monitoring. Failures are retried
 //! with backoff and recorded as `notification.failed` events.
 
-use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -171,11 +171,7 @@ impl Notifier {
     /// Record finished deliveries and hand out new alerts.
     pub(crate) fn step(&mut self, store: &Store) -> rusqlite::Result<()> {
         let conn = store.connection();
-        loop {
-            let d = match self.done.try_recv() {
-                Ok(d) => d,
-                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
-            };
+        while let Ok(d) = self.done.try_recv() {
             let ch = &mut self.channels[d.channel];
             ch.busy = false;
             let name = ch.kind.as_str();

@@ -381,10 +381,20 @@ pub enum ConfigCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum ReportCommand {
-    /// Report for one scan
+    /// Report for one scan: its ID, UUID or "latest"
     Scan { id: String },
-    /// Host security summary
-    Summary,
+    /// List recorded scans
+    Scans {
+        #[command(flatten)]
+        range: TimeRange,
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+    },
+    /// Host security summary for a period (default: the last 7 days)
+    Summary {
+        #[command(flatten)]
+        range: TimeRange,
+    },
 }
 
 #[derive(Debug, Args)]

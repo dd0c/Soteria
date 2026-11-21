@@ -331,12 +331,10 @@ fn verify_before_init_exits_5() {
 #[test]
 fn unavailable_commands_exit_7_with_json_error() {
     let env = Env::new();
-    for args in [vec!["scan", "--kernel"], vec!["report", "summary"]] {
-        let (code, v) = env.json(&args);
-        assert_eq!(code, 7, "{args:?}");
-        assert_eq!(v["kind"], "unavailable");
-        assert!(v["message"].as_str().unwrap().contains("milestone"));
-    }
+    let (code, v) = env.json(&["scan", "--kernel"]);
+    assert_eq!(code, 7);
+    assert_eq!(v["kind"], "unavailable");
+    assert!(v["message"].as_str().unwrap().contains("milestone"));
 }
 
 #[test]
@@ -631,6 +629,44 @@ fn test_notifications_reports_each_channel() {
     assert_eq!(code, 1, "{v}");
     assert_eq!(v["channels"][0]["channel"], "webhook");
     assert_eq!(v["channels"][0]["delivered"], false);
+}
+
+#[test]
+fn reports_cover_scans_and_a_summary() {
+    let env = Env::new();
+    std::fs::create_dir_all(env.root()).unwrap();
+    std::fs::write(env.root().join("a"), "x").unwrap();
+    env.init();
+    env.cmd()
+        .args(["scan"])
+        .assert()
+        .code(predicate::in_iter([0, 1]));
+    let (code, v) = env.json(&["report", "scans"]);
+    assert_eq!(code, 0, "{v}");
+    let scans = v.as_array().unwrap();
+    assert!(!scans.is_empty(), "{v}");
+    let (code, v) = env.json(&["report", "scan", "latest"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["scan"]["id"], scans[0]["id"]);
+    assert!(v["scan"]["checked"].as_i64().unwrap() >= 1, "{v}");
+    let uuid = v["scan"]["uuid"].as_str().unwrap().to_owned();
+    env.cmd()
+        .args(["report", "scan", &uuid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Result:"));
+    assert_eq!(env.json(&["report", "scan", "nope"]).0, 2);
+
+    insert_alert(&env, "/tmp/x");
+    let (code, v) = env.json(&["report", "summary", "--since", "100000d"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["alerts_raised"]["high"], 1, "{v}");
+    assert_eq!(v["top_rules"][0][0], "EXE-001");
+    env.cmd()
+        .args(["report", "summary"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("SOTERIA SECURITY SUMMARY"));
 }
 
 #[test]
