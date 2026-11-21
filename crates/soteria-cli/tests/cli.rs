@@ -334,12 +334,16 @@ fn verify_before_init_exits_5() {
 }
 
 #[test]
-fn unavailable_commands_exit_7_with_json_error() {
+fn kernel_scan_shows_state_without_recording_it() {
     let env = Env::new();
+    let (code, _) = env.json(&["scan", "--kernel"]);
+    assert_eq!(code, 5, "needs an initialized database");
+    env.json(&["init"]);
     let (code, v) = env.json(&["scan", "--kernel"]);
-    assert_eq!(code, 7);
-    assert_eq!(v["kind"], "unavailable");
-    assert!(v["message"].as_str().unwrap().contains("milestone"));
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["recorded"], false);
+    assert!(v["current"]["release"].is_string());
+    assert!(v["findings"].as_array().unwrap().is_empty());
 }
 
 #[test]

@@ -496,7 +496,7 @@ fn base64_encode_nopad(data: &[u8]) -> String {
 }
 
 /// One security-relevant difference between two snapshots.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Finding {
     pub rule: &'static str,
     pub severity: Severity,

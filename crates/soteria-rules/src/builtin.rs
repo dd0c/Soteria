@@ -185,6 +185,17 @@ pub const BUILTIN: &[Builtin] = &[
                          modified scripts run by interpreters are a common persistence and execution technique.",
     },
     Builtin {
+        id: "EXE-006",
+        title: "Untrusted privilege transition",
+        category: Category::Execution,
+        severity: Some(Severity::High),
+        severity_note: None,
+        description: "A program that is not trusted by the approved baseline ran with root privileges for an unprivileged user (setuid or file capabilities).",
+        recommendation: "Check the program's setuid bit and capabilities (ls -l, getcap), its package (rpm -qf / dpkg -S) \
+                         and who ran it. An unknown setuid-root program is a classic privilege-escalation backdoor; \
+                         remove the bit (chmod u-s) if it is not authorized.",
+    },
+    Builtin {
         id: "SELF-001",
         title: "Soteria's own files changed",
         category: Category::Integrity,

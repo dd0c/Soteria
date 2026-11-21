@@ -863,3 +863,30 @@ fn an_unclean_stop_is_reported_at_start() {
     assert!(alerts(&agent).iter().any(|a| a.0 == "SELF-002"));
     agent.shutdown();
 }
+
+#[test]
+fn untrusted_setuid_transition_is_reported() {
+    let f = fixture();
+    let mut agent = start(&f, quiet());
+    let new = f.root.join("bin/rootme");
+    fs::write(&new, "#!/bin/sh\nid\n").unwrap();
+    let mut ev = exec_event(11, 1, &new, &["rootme"]);
+    ev.euid = 0;
+    agent.handle_exec(&ev).unwrap();
+    assert!(
+        rules(&agent).contains(&"EXE-006".to_owned()),
+        "{:?}",
+        rules(&agent)
+    );
+
+    // A trusted program (in the baseline, unchanged) is not reported.
+    let tool = f.root.join("bin/tool");
+    let mut ev = exec_event(12, 1, &tool, &["tool"]);
+    ev.euid = 0;
+    let h = agent.handle_exec(&ev).unwrap();
+    if h.classification == exec::Classification::Trusted {
+        let n = rules(&agent).iter().filter(|r| *r == "EXE-006").count();
+        assert_eq!(n, 1);
+    }
+    agent.shutdown();
+}

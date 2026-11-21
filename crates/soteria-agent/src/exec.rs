@@ -402,6 +402,26 @@ impl ExecMonitor {
                 identity: json!({ "parent": parent, "child": child }),
             });
         }
+        // Privilege transition (FR-026): a setuid-root program that is not
+        // trusted by the baseline ran for an unprivileged user.
+        if ev.euid == 0 && ev.uid != 0 && class != Classification::Trusted {
+            hits.push(Hit {
+                rule: "EXE-006".into(),
+                severity: Severity::High,
+                object: exe_path.clone(),
+                reason: format!(
+                    "A program that is {} gave user {} root privileges (effective UID 0).",
+                    match class {
+                        Classification::KnownModified => "modified since the approved baseline",
+                        Classification::Unverified => "not verified against a baseline",
+                        _ => "not in the approved baseline",
+                    },
+                    ev.uid
+                ),
+                recommendation: soteria_rules::builtin("EXE-006").recommendation.into(),
+                identity: json!({ "sha256": sha256, "uid": ev.uid }),
+            });
+        }
         if let Some(s) = &script
             && script_loc.recently_changed
             && !script_loc.unusual()

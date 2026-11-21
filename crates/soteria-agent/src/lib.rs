@@ -11,6 +11,7 @@ pub mod alerts;
 pub mod exec;
 mod exec_sensor;
 pub mod incidents;
+pub mod kernel;
 pub mod lifecycle;
 mod notify;
 pub mod retention;
@@ -102,6 +103,8 @@ pub struct Options {
     pub interrupted: Option<selfcheck::Interruption>,
     /// Where account files are read from (tests use a temporary root).
     pub accounts: accounts::Sources,
+    /// Where kernel state is read from (tests use a temporary root).
+    pub kernel: kernel::Sources,
 }
 
 impl Default for Options {
@@ -115,6 +118,7 @@ impl Default for Options {
             config_path: None,
             interrupted: None,
             accounts: accounts::Sources::default(),
+            kernel: kernel::Sources::default(),
         }
     }
 }
@@ -183,6 +187,9 @@ pub struct Agent {
     accounts: Option<accounts::Sources>,
     /// An account source changed: compare at the next step.
     accounts_due: bool,
+    /// Kernel sources, when kernel monitoring is enabled (FR-022..024).
+    kernel: Option<kernel::Sources>,
+    next_kernel: Instant,
 }
 
 impl Agent {
@@ -213,6 +220,8 @@ impl Agent {
             next_retention: now_i + RETENTION_FIRST,
             accounts: config.monitoring.users.then(|| options.accounts.clone()),
             accounts_due: false,
+            kernel: config.monitoring.kernel.then(|| options.kernel.clone()),
+            next_kernel: now_i + kernel::POLL,
             own_files: if config.paths.own_files {
                 scope::self_paths(&config, options.config_path.as_deref())
             } else {
@@ -252,21 +261,6 @@ impl Agent {
 
         agent.refresh_baseline()?;
 
-        // Monitors that arrive in later milestones are recorded as
-        // unavailable rather than silently absent.
-        let m = &agent.config.monitoring;
-        let planned = [(
-            "kernel",
-            m.kernel,
-            "kernel and boot monitoring arrives in a later release",
-        )];
-        for (sensor, enabled, detail) in planned {
-            if enabled {
-                agent.health(sensor, "unavailable", Some(detail));
-            } else {
-                agent.health(sensor, "disabled", Some("disabled by configuration"));
-            }
-        }
         if !agent.config.monitoring.persistence {
             agent.health("persistence", "disabled", Some("disabled by configuration"));
         } else if !agent.config.monitoring.file_integrity {
@@ -281,6 +275,15 @@ impl Agent {
                 "persistence",
                 "running",
                 Some(&format!("{n} persistence location pattern(s) monitored")),
+            );
+        }
+        if agent.config.monitoring.kernel {
+            agent.check_kernel()?;
+        } else {
+            agent.health(
+                kernel::SENSOR,
+                "disabled",
+                Some("disabled by configuration"),
             );
         }
         if agent.config.monitoring.users {
@@ -439,6 +442,10 @@ impl Agent {
         } else if now_i >= self.next_critical {
             self.critical_scan()?;
             self.next_critical = Instant::now() + self.config.scanning.critical_scan_interval.0;
+        }
+        if now_i >= self.next_kernel {
+            self.check_kernel()?;
+            self.next_kernel = Instant::now() + kernel::POLL;
         }
         self.after_alerts()?;
         Ok(())
