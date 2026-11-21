@@ -247,8 +247,8 @@ fn init_creates_private_database_and_is_repeatable() {
     let env = Env::new();
     let (code, v) = env.json(&["init"]);
     assert!(code == 0 || code == 1, "init exit {code}: {v}");
-    assert_eq!(v["schema_version"], 1);
-    assert_eq!(v["migrations_applied"], serde_json::json!([1]));
+    assert_eq!(v["schema_version"], 2);
+    assert_eq!(v["migrations_applied"], serde_json::json!([1, 2]));
 
     use std::os::unix::fs::PermissionsExt;
     let mode = std::fs::metadata(env.db()).unwrap().permissions().mode() & 0o777;
@@ -331,7 +331,6 @@ fn unavailable_commands_exit_7_with_json_error() {
         vec!["scan", "--kernel"],
         vec!["alerts", "ack", "1"],
         vec!["alerts", "export"],
-        vec!["processes"],
         vec!["rules", "list"],
         vec!["report", "summary"],
     ] {
@@ -462,6 +461,34 @@ fn events_and_alerts_queries() {
         vec!["events", "--since", "yesterday-ish"],
         vec!["events", "--severity", "urgent"],
         vec!["alerts", "list", "--status", "pending"],
+    ] {
+        let (code, v) = env.json(&bad);
+        assert_eq!(code, 2, "{bad:?}: {v}");
+    }
+}
+
+#[test]
+fn processes_queries() {
+    let env = Env::new();
+    env.init();
+    let (code, v) = env.json(&[
+        "processes",
+        "--since",
+        "1h",
+        "--classification",
+        "suspicious",
+    ]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["total_matching"], 0);
+    env.cmd()
+        .args(["processes", "--exe", "bash"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No executions match."));
+    for bad in [
+        vec!["processes", "--classification", "evil"],
+        vec!["processes", "--user", "no-such-user-xyz"],
+        vec!["processes", "--severity", "urgent"],
     ] {
         let (code, v) = env.json(&bad);
         assert_eq!(code, 2, "{bad:?}: {v}");
@@ -805,6 +832,89 @@ fn daemon_alerts_on_live_change() {
     let (code, v) = env.json(&["status"]);
     assert_eq!(code, 1);
     assert!(v["open_alerts"]["total"].as_u64().unwrap() >= 1, "{v}");
+
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+/// Needs root, kernel audit support and the execve audit rule
+/// (packaging/audit/soteria.rules). Skipped, with a message, where the
+/// execution sensor cannot run, such as in most containers.
+#[test]
+fn daemon_alerts_on_execution_from_unusual_location() {
+    require_root!();
+    let env = Env::new();
+    let drop_dir = env.dir.path().join("dropzone");
+    std::fs::create_dir_all(&drop_dir).unwrap();
+    let text = std::fs::read_to_string(&env.config).unwrap();
+    let start = text.find("unusual_paths = [").unwrap();
+    let end = start + text[start..].find(']').unwrap() + 1;
+    let mut text = text;
+    text.replace_range(
+        start..end,
+        &format!("unusual_paths = [{:?}]", drop_dir.to_str().unwrap()),
+    );
+    std::fs::write(&env.config, text).unwrap();
+    env.init_approved();
+
+    let mut child = env.spawn_daemon();
+    let started = Instant::now();
+    let state = loop {
+        let (_, v) = env.json(&["status"]);
+        let exec = v["sensors"]
+            .as_array()
+            .and_then(|a| a.iter().find(|s| s["sensor"] == "execution").cloned());
+        let state = exec
+            .as_ref()
+            .and_then(|e| e["state"].as_str().map(str::to_owned));
+        if matches!(state.as_deref(), Some("running" | "degraded" | "failed"))
+            || started.elapsed() > Duration::from_secs(15)
+        {
+            break state;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    if state.as_deref() != Some("running") {
+        child.kill().unwrap();
+        child.wait().unwrap();
+        eprintln!(
+            "skipping: execution sensor is {state:?} here (needs audit support and the execve rule)"
+        );
+        return;
+    }
+
+    let prog = drop_dir.join("payload");
+    std::fs::copy("/bin/true", &prog).unwrap();
+    let out = StdCommand::new(&prog)
+        .arg("--password=hunter2")
+        .status()
+        .unwrap();
+    assert!(out.success());
+
+    wait_until("EXE-001 alert for the payload", || {
+        let (_, v) = env.json(&["alerts", "list"]);
+        v["alerts"].as_array().unwrap().iter().any(|a| {
+            a["rule_id"] == "EXE-001" && a["object"].as_str().unwrap().ends_with("dropzone/payload")
+        })
+    });
+    let (code, v) = env.json(&["processes", "--exe", prog.to_str().unwrap()]);
+    assert_eq!(code, 0);
+    let p = &v["processes"][0];
+    assert_eq!(p["classification"], "suspicious", "{v}");
+    assert_eq!(p["argv"][1], "--password=[REDACTED]", "{v}");
+    assert_eq!(
+        p["ppid"].as_u64().unwrap(),
+        std::process::id() as u64,
+        "{v}"
+    );
+    let (_, v) = env.json(&[
+        "processes",
+        "--classification",
+        "suspicious",
+        "--exe",
+        "payload",
+    ]);
+    assert!(v["total_matching"].as_u64().unwrap() >= 1, "{v}");
 
     child.kill().unwrap();
     child.wait().unwrap();

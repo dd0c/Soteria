@@ -33,7 +33,13 @@ pub fn run(global: &GlobalArgs) -> CmdResult {
         warn!(field = %issue.field, "{}", issue.message);
     }
 
-    let store = Store::open(&config.general.database).map_err(store_failure)?;
+    // The daemon owns the database: after a package upgrade it applies
+    // pending schema migrations itself.
+    let (store, migrated) =
+        Store::open_and_migrate(&config.general.database).map_err(store_failure)?;
+    if !migrated.is_empty() {
+        info!(versions = ?migrated, "database schema migrated");
+    }
 
     match store.integrity_check() {
         Ok(p) if p.is_empty() => {}

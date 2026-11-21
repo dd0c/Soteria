@@ -38,6 +38,22 @@ include = [
 ]
 exclude = ["/proc", "/sys", "/dev", "/run"]
 
+[execution]
+# Command-line arguments stored with each execution (NFR-011):
+#   "redacted" (values that look like passwords, tokens or keys are
+#   replaced), "full", or "none" (program name only).
+arguments = "redacted"
+max_argument_bytes = 4096
+# Executables larger than this are not hashed (bytes).
+hash_max_bytes = 268435456
+# Execution from these locations is flagged as unusual (FR-011), as is
+# execution of hidden, deleted, memory-only or non-root-writable programs.
+unusual_paths = [
+  "/tmp", "/var/tmp", "/dev/shm", "/run/user", "/dev/mqueue", "/home", "/root"
+]
+# A program created or changed this recently counts as new.
+recent_change = "1h"
+
 [baseline]
 # Ed25519 key pair that seals approved baselines, created by `soteria init`.
 # The signing key must be readable by root only; the daemon only reads the

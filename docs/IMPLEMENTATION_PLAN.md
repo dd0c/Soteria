@@ -43,7 +43,7 @@ cannot do.
 | M6 | System monitoring and hardening | 6 | FR-019/020, FR-022..027, NFR-008..016 | Config, persistence, account, kernel/boot monitoring, self-integrity, privileged helper with authenticated IPC, SELinux policy module, AppArmor profile, systemd hardening |
 | M7 | Packaging and release | 7 | 9, 11, 12, 13 | RPM (RHEL 9/10), DEB (Debian 13), install/upgrade/remove scripts, container-based test matrix, benchmarks, admin documentation |
 
-Progress: M1 and M2 merged (PRs #1, #2). M3 in review.
+Progress: M1 to M3 merged (PRs #1 to #3). M4 in review.
 
 ## Key design choices (proposed)
 
@@ -56,9 +56,11 @@ Progress: M1 and M2 merged (PRs #1, #2). M3 in review.
   Approval (`sudo soteria baseline approve`) signs; the daemon holds only the
   public key and verifies. A compromised `soteria` account therefore cannot
   forge a baseline, though local root still can (SRS 10.2).
-- **Execution sensor (FR-009):** subscribe to the kernel audit multicast group
-  over netlink (`CAP_AUDIT_READ`). This coexists with `auditd` instead of
-  replacing it, and needs no log parsing.
+- **Execution sensor (FR-009), decided:** subscribe to the kernel audit
+  multicast group over netlink (`CAP_AUDIT_READ`). This coexists with
+  `auditd` instead of replacing it, and needs no log parsing. The execve
+  audit rule ships as `/etc/audit/rules.d/soteria.rules` and is loaded by
+  auditd; Soteria never changes audit rules itself.
 - **Filesystem sensor (FR-014), decided:** inotify only. It works for the
   unprivileged daemon; fanotify would need `CAP_SYS_ADMIN` and is not used.
   Unwatchable directories and queue overflow become coverage gaps, and
@@ -95,8 +97,8 @@ Progress: M1 and M2 merged (PRs #1, #2). M3 in review.
    would need `CAP_SYS_ADMIN`. inotify does not identify the process that
    made a change, so integrity alerts record the actor as unknown until
    execution telemetry (M4) can be correlated (M5).
-9. Monitors enabled in the configuration but not built yet (execution,
-   kernel, persistence, users) are reported as `unavailable` sensors, which
+9. Monitors enabled in the configuration but not built yet (kernel,
+   persistence, users) are reported as `unavailable` sensors, which
    keeps protection at `DEGRADED` instead of `ACTIVE` (SRS 4.7).
 10. Scans record `file.created/modified/deleted` events (sensor `scanner`) for
     changes they find, so the event history includes changes no live event
@@ -104,3 +106,18 @@ Progress: M1 and M2 merged (PRs #1, #2). M3 in review.
 11. A full scan holds the database for its duration, so status treats a
     recent running scan as liveness, and the systemd watchdog is fed by a
     separate thread with a 30-minute stall limit.
+12. Execution monitoring needs auditd to load its rule. A self-test (the
+    agent runs `/bin/true` and looks for it in the stream) detects a
+    missing rule, since listing audit rules needs `CAP_AUDIT_CONTROL`.
+    Consequence: auditd also logs every execution to `/var/log/audit`.
+13. Classification applies to the program image the kernel loaded. When an
+    interpreter runs a script, the script is checked for unusual location
+    and recent change, but it is not hashed.
+14. Execution severities and the service and shell lists for EXE-004 are
+    built in; the M5 rule engine makes them configurable.
+15. The daemon applies pending database migrations at start, so a package
+    upgrade needs no manual step. CLI commands still refuse an outdated
+    database and point to `soteria init`.
+16. Configuration gains an `[execution]` section: argument privacy,
+    `max_argument_bytes`, `hash_max_bytes`, `unusual_paths` and
+    `recent_change`.

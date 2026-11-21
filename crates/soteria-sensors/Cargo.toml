@@ -11,6 +11,7 @@ workspace = true
 [dependencies]
 soteria-inventory.workspace = true
 inotify.workspace = true
+netlink-sys.workspace = true
 serde.workspace = true
 tracing.workspace = true
 

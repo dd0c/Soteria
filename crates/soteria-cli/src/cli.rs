@@ -287,6 +287,9 @@ pub struct ProcessesArgs {
     /// trusted, known_modified, unknown, suspicious or unverified
     #[arg(long)]
     pub classification: Option<String>,
+    /// Maximum number of rows
+    #[arg(long, default_value_t = 100)]
+    pub limit: u32,
 }
 
 #[derive(Debug, Subcommand)]

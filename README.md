@@ -12,13 +12,17 @@ and program execution, and reports deviations and monitoring gaps locally.
 
 ## Status
 
-Milestones 1 to 3 are in place: CLI, configuration validation, platform
+Milestones 1 to 4 are in place: CLI, configuration validation, platform
 detection, SQLite storage, the daemon and systemd unit, file inventory
 (classification, metadata, SHA-256), signed baselines and baseline
-comparison, and live file integrity monitoring with alerts, scheduled
-reconciliation and sensor health. Execution, kernel, persistence and account
-monitoring arrive in later milestones; commands that are not available yet
+comparison, live file integrity monitoring with scheduled reconciliation,
+and execution monitoring through the kernel audit stream (classification,
+unusual locations, lineage, search). Kernel, persistence and account
+monitoring arrive in a later milestone; commands that are not available yet
 say so and exit with code 7.
+
+Execution monitoring needs auditd and the rules file
+`packaging/audit/soteria.rules` (see [docs/CLI.md](docs/CLI.md#execution-monitoring)).
 
 ## Building
 
@@ -39,8 +43,9 @@ export SOTERIA_CONFIG=/tmp/soteria.toml
 sudo -E soteria init          # inventories, then asks you to approve the baseline
 soteria status
 sudo -E soteria scan --baseline   # rescan and list deviations from the baseline
+sudo cp packaging/audit/soteria.rules /etc/audit/rules.d/ && sudo augenrules --load
 sudo -E soteria daemon &          # live monitoring in the foreground
-soteria alerts list; soteria events --since 10m
+soteria alerts list; soteria events --since 10m; soteria processes --since 10m
 ```
 
 ## Layout
@@ -53,11 +58,12 @@ soteria alerts list; soteria events --since 10m
 | `crates/soteria-store` | SQLite schema, migrations and storage |
 | `crates/soteria-inventory` | File discovery, classification, metadata and hashing |
 | `crates/soteria-integrity` | Scans, signed baselines and comparison |
-| `crates/soteria-sensors` | Event sensors (inotify filesystem sensor) |
+| `crates/soteria-sensors` | Event sensors: inotify filesystem sensor, kernel audit execution sensor |
 | `crates/soteria-agent` | Monitoring agent: event verification, alerts, scheduled scans, health |
 | `crates/soteria-cli` | The `soteria` binary (CLI and daemon) |
 | `packaging/config/soteria.toml` | Default `/etc/soteria/soteria.toml` |
 | `packaging/systemd/soteria.service` | Hardened systemd unit |
+| `packaging/audit/soteria.rules` | auditd rule that reports program executions |
 
 ## Security limitations
 

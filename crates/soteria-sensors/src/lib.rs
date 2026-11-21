@@ -1,4 +1,5 @@
-//! Event sensors. Milestone 3 provides the filesystem sensor; execution and
-//! system sensors are added in later milestones.
+//! Event sensors: filesystem (inotify) and execution (kernel audit stream).
+//! System sensors are added in a later milestone.
 
+pub mod audit;
 pub mod fs;

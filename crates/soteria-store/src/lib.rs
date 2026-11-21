@@ -19,7 +19,10 @@ use serde::Serialize;
 use soteria_core::Severity;
 
 /// Ordered migrations. Index + 1 is the schema version the migration produces.
-const MIGRATIONS: &[&str] = &[include_str!("../migrations/0001_initial.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("../migrations/0001_initial.sql"),
+    include_str!("../migrations/0002_execution.sql"),
+];
 
 /// Schema version this build writes.
 pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;
@@ -101,6 +104,26 @@ impl Store {
     /// Open an existing, fully migrated database for reading and writing.
     pub fn open(path: &Path) -> Result<Store> {
         Store::open_with(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+    }
+
+    /// Open an existing database and apply pending migrations (each in its
+    /// own transaction). Used by the daemon, which owns the database, so a
+    /// package upgrade does not need a manual step. Returns the versions
+    /// applied.
+    pub fn open_and_migrate(path: &Path) -> Result<(Store, Vec<u32>)> {
+        match Store::open(path) {
+            Ok(store) => Ok((store, Vec::new())),
+            Err(StoreError::NeedsMigration { .. }) => {
+                let conn = Connection::open_with_flags(
+                    path,
+                    OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                )?;
+                let mut store = Store::configure(conn, path)?;
+                let applied = store.migrate()?;
+                Ok((store, applied))
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Open an existing database read-only, for CLI queries.
@@ -673,6 +696,37 @@ mod tests {
     }
 
     #[test]
+    fn daemon_open_applies_pending_migrations() {
+        let (_d, store) = fresh();
+        let path = store.path().to_owned();
+        // Pretend the database predates the latest migration.
+        store
+            .connection()
+            .execute_batch(&format!(
+                "DROP INDEX processes_classification_ts; DROP INDEX processes_severity_ts;
+                 ALTER TABLE processes DROP COLUMN audit_serial; ALTER TABLE processes DROP COLUMN limitations;
+                 ALTER TABLE processes DROP COLUMN parent_id; ALTER TABLE processes DROP COLUMN parent_comm;
+                 ALTER TABLE processes DROP COLUMN parent_exe; ALTER TABLE processes DROP COLUMN script;
+                 ALTER TABLE processes DROP COLUMN path; ALTER TABLE processes DROP COLUMN tty;
+                 ALTER TABLE processes DROP COLUMN session; ALTER TABLE processes DROP COLUMN auid;
+                 DELETE FROM schema_migrations WHERE version = {SCHEMA_VERSION};
+                 PRAGMA user_version = {};",
+                SCHEMA_VERSION - 1
+            ))
+            .unwrap();
+        drop(store);
+        assert!(matches!(
+            Store::open(&path),
+            Err(StoreError::NeedsMigration { .. })
+        ));
+        let (store, applied) = Store::open_and_migrate(&path).unwrap();
+        assert_eq!(applied, vec![SCHEMA_VERSION]);
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        let (_, applied) = Store::open_and_migrate(&path).unwrap();
+        assert!(applied.is_empty());
+    }
+
+    #[test]
     fn read_only_store_cannot_write() {
         let (_d, store) = fresh();
         let path = store.path().to_owned();
@@ -686,11 +740,14 @@ mod tests {
         let (_d, store) = fresh();
         let path = store.path().to_owned();
         drop(store);
-        // Overwrite a page in the middle of the file.
+        // Damage every page after the first, so the result does not depend
+        // on which pages the schema happens to use.
         let mut bytes = std::fs::read(&path).unwrap();
-        let len = bytes.len();
-        for b in &mut bytes[len / 2..len / 2 + 512] {
-            *b = 0xFF;
+        for page in bytes.chunks_mut(4096).skip(1) {
+            let n = page.len().min(512);
+            for b in &mut page[..n] {
+                *b = 0xFF;
+            }
         }
         std::fs::write(&path, bytes).unwrap();
         let result = Store::open(&path).and_then(|s| s.integrity_check());

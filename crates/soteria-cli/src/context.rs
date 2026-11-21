@@ -114,7 +114,7 @@ pub fn lookup_user(name: &str) -> Option<(u32, u32)> {
     })
 }
 
-fn user_name(uid: u32) -> Option<String> {
+pub fn user_name(uid: u32) -> Option<String> {
     let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
     passwd.lines().find_map(|line| {
         let f: Vec<&str> = line.split(':').collect();
