@@ -161,13 +161,34 @@ pub struct WalkStats {
 }
 
 /// Configured scope of a scan.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Scope {
     pub include: Vec<PathBuf>,
     pub exclude: Vec<PathBuf>,
+    /// Files and directories that are monitored when they exist, such as
+    /// users' SSH keys and shell startup files (FR-020) or Soteria's own
+    /// files (FR-036). Their absence is not a coverage gap.
+    pub optional: Vec<PathBuf>,
 }
 
 impl Scope {
+    /// Whether `path` is at or below an include or optional root and not
+    /// excluded.
+    pub fn contains(&self, path: &Path) -> bool {
+        !self.is_excluded(path)
+            && self
+                .include
+                .iter()
+                .chain(&self.optional)
+                .any(|r| starts_with_components(path, r))
+    }
+
+    fn is_optional_root(&self, path: &Path) -> bool {
+        let n = normalize(path);
+        self.optional.iter().any(|o| normalize(o) == n)
+            && !self.include.iter().any(|i| normalize(i) == n)
+    }
+
     pub fn is_excluded(&self, path: &Path) -> bool {
         self.exclude
             .iter()
@@ -180,6 +201,7 @@ impl Scope {
         let mut roots: Vec<PathBuf> = self
             .include
             .iter()
+            .chain(&self.optional)
             .map(|p| normalize(p))
             .filter(|p| !self.is_excluded(p))
             .collect();
@@ -189,6 +211,76 @@ impl Scope {
         roots.retain(|r| !all.iter().any(|o| o != r && starts_with_components(r, o)));
         roots
     }
+}
+
+/// Expand a path pattern in which `*` and `?` match within one component,
+/// as a shell does: wildcards do not match a leading dot, and only real
+/// directories (not symlinks) are descended into. Paths without wildcards
+/// are returned as they are, existing or not.
+pub fn expand_pattern(pattern: &Path) -> Vec<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let wild = |b: &[u8]| b.iter().any(|c| *c == b'*' || *c == b'?');
+    if !wild(pattern.as_os_str().as_bytes()) {
+        return vec![pattern.to_owned()];
+    }
+    let parts: Vec<Component> = pattern.components().collect();
+    let mut found = vec![PathBuf::new()];
+    for (i, part) in parts.iter().enumerate() {
+        let last = i + 1 == parts.len();
+        let name = part.as_os_str().as_bytes();
+        if !wild(name) {
+            for f in &mut found {
+                f.push(part.as_os_str());
+            }
+            continue;
+        }
+        let mut next = Vec::new();
+        for dir in &found {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let file = entry.file_name();
+                if !wildcard_match(name, file.as_bytes()) {
+                    continue;
+                }
+                let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                if last || is_dir {
+                    next.push(dir.join(&file));
+                }
+            }
+        }
+        next.sort();
+        found = next;
+    }
+    // Literal components after a wildcard were not checked.
+    found.retain(|p| std::fs::symlink_metadata(p).is_ok());
+    found
+}
+
+fn wildcard_match(pattern: &[u8], name: &[u8]) -> bool {
+    if name.first() == Some(&b'.') && pattern.first() != Some(&b'.') {
+        return false;
+    }
+    // Iterative matcher with backtracking to the last `*`.
+    let (mut p, mut n) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while n < name.len() {
+        if p < pattern.len() && (pattern[p] == b'?' || pattern[p] == name[n]) {
+            p += 1;
+            n += 1;
+        } else if p < pattern.len() && pattern[p] == b'*' {
+            star = Some((p, n));
+            p += 1;
+        } else if let Some((sp, sn)) = star {
+            p = sp + 1;
+            n = sn + 1;
+            star = Some((sp, sn + 1));
+        } else {
+            return false;
+        }
+    }
+    pattern[p..].iter().all(|c| *c == b'*')
 }
 
 fn normalize(p: &Path) -> PathBuf {
@@ -238,6 +330,12 @@ impl<'a> Scanner<'a> {
             return;
         }
         match std::fs::symlink_metadata(root) {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    && self.scope.is_optional_root(root) =>
+            {
+                return;
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 self.stats.skipped += 1;
                 visitor.gap(Gap {
@@ -460,7 +558,51 @@ mod tests {
         Scope {
             include: include.iter().map(|p| p.to_path_buf()).collect(),
             exclude: exclude.iter().map(|p| p.to_path_buf()).collect(),
+            optional: Vec::new(),
         }
+    }
+
+    #[test]
+    fn wildcards_match_within_a_component() {
+        assert!(wildcard_match(b"*", b"alice"));
+        assert!(!wildcard_match(b"*", b".hidden"));
+        assert!(wildcard_match(b".*rc", b".bashrc"));
+        assert!(wildcard_match(b"a?c*", b"abcdef"));
+        assert!(!wildcard_match(b"a?c", b"abcd"));
+    }
+
+    #[test]
+    fn patterns_expand_to_existing_paths_without_following_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        for u in ["alice", "bob"] {
+            std::fs::create_dir_all(home.join(u).join(".ssh")).unwrap();
+        }
+        std::fs::create_dir_all(dir.path().join("elsewhere/.ssh")).unwrap();
+        symlink(dir.path().join("elsewhere"), home.join("link")).unwrap();
+        std::fs::create_dir_all(home.join("carl")).unwrap();
+        let got = expand_pattern(&home.join("*/.ssh"));
+        assert_eq!(got, vec![home.join("alice/.ssh"), home.join("bob/.ssh")]);
+        // No wildcard: returned whether it exists or not.
+        let plain = home.join("carol/.ssh");
+        assert_eq!(expand_pattern(&plain), vec![plain]);
+    }
+
+    #[test]
+    fn missing_optional_roots_are_not_gaps() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("present"), b"x").unwrap();
+        let s = Scope {
+            include: Vec::new(),
+            exclude: Vec::new(),
+            optional: vec![dir.path().join("present"), dir.path().join("absent")],
+        };
+        let mut c = Collect::default();
+        Scanner::new(&s).walk_all(&mut c);
+        assert!(c.gaps.is_empty(), "{:?}", c.gaps);
+        assert_eq!(c.records.len(), 1);
+        assert!(s.contains(&dir.path().join("present")));
+        assert!(!s.contains(dir.path()));
     }
 
     #[test]

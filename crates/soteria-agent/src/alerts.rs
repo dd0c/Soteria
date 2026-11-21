@@ -124,6 +124,9 @@ pub struct NewAlert<'a> {
     pub source: Source,
     pub baseline_version: u32,
     pub hostname: &'a str,
+    /// The object is one of Soteria's own files (FR-036): any deviation
+    /// beyond metadata is reported as SELF-001.
+    pub own_file: bool,
 }
 
 /// Outcome of [`raise`].
@@ -266,16 +269,26 @@ pub fn raise<'r>(
 ) -> rusqlite::Result<Raised> {
     let policy = policy.into();
     let c = a.change;
-    let rule = rule_for(primary(&c.kinds));
+    let kind = primary(&c.kinds);
+    let fim = rule_for(kind);
+    let own = a.own_file && kind != ChangeKind::MetadataModified;
+    let rule = if own {
+        soteria_rules::builtin("SELF-001")
+    } else {
+        fim
+    };
     let object = String::from_utf8_lossy(c.path.as_os_str().as_bytes()).into_owned();
     let before = c.before.as_ref().map(state_json);
     let after = c.after.as_ref().map(state_json);
     let kinds: Vec<&str> = c.kinds.iter().map(|k| k.as_str()).collect();
-    let reason = if c.kinds.len() > 1 {
-        format!("{} Also changed: {}.", rule.description, kinds.join(", "))
+    let mut reason = if c.kinds.len() > 1 {
+        format!("{} Also changed: {}.", fim.description, kinds.join(", "))
     } else {
-        rule.description.to_owned()
+        fim.description.to_owned()
     };
+    if own {
+        reason = format!("{} {reason}", rule.description);
+    }
     let evidence = json!({
         "source": a.source.as_str(),
         "baseline_version": a.baseline_version,
@@ -290,7 +303,7 @@ pub fn raise<'r>(
         AlertSpec {
             alert_type: "file_integrity",
             rule_id: rule.id,
-            severity: c.severity,
+            severity: if own { Severity::Critical } else { c.severity },
             hostname: a.hostname,
             object: &object,
             reason: &reason,
@@ -397,6 +410,7 @@ mod tests {
 
     fn alert<'a>(c: &'a Change) -> NewAlert<'a> {
         NewAlert {
+            own_file: false,
             change: c,
             source: Source::FsEvent,
             baseline_version: 1,

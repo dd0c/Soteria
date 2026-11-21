@@ -37,7 +37,7 @@ pub fn run(args: &ScanArgs, global: &GlobalArgs, out: &Output) -> CmdResult {
     }
     let (config, _) = load_config(&global.config)?;
     let mut store = open_store(&config)?;
-    let scope = scope(&config);
+    let scope = scope(&config, &global.config);
 
     let (target, scan_type) = match (&t.dir, &t.file) {
         (Some(d), _) => (ScanTarget::Directory(absolute(d)?), "directory"),

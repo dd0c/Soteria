@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use soteria_store::{Store, Summary};
 
-pub const HEARTBEAT_KEY: &str = "agent_heartbeat";
+pub const HEARTBEAT_KEY: &str = soteria_agent::selfcheck::HEARTBEAT_KEY;
 pub const HEARTBEAT_INTERVAL_SECS: u64 = 15;
 /// A heartbeat older than this means the agent is not responding.
 pub const HEARTBEAT_STALE_SECS: i64 = 90;

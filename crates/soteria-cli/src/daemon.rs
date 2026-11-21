@@ -51,6 +51,17 @@ pub fn run(global: &GlobalArgs) -> CmdResult {
         Err(e) => return Err(store_failure(e)),
     }
 
+    // Before this run records anything: did the last one stop cleanly?
+    let previous =
+        soteria_agent::selfcheck::previous_run(&store).map_err(|e| store_failure(e.into()))?;
+    if let Some(p) = &previous {
+        warn!(
+            last_state = %p.last_state,
+            last_seen = p.last_seen.as_deref().unwrap_or("unknown"),
+            "the previous run did not stop cleanly; monitoring was interrupted"
+        );
+    }
+
     let interrupted = store.mark_interrupted_scans().map_err(store_failure)?;
     if interrupted > 0 {
         warn!(
@@ -77,7 +88,16 @@ pub fn run(global: &GlobalArgs) -> CmdResult {
     // Starting the agent verifies the approved baseline's seal (FR-032):
     // a failed seal raises a critical alert but does not stop the agent,
     // which must keep reporting.
-    let mut agent = Agent::start(config, store, Options::default()).map_err(|e| match e {
+    let mut agent = Agent::start(
+        config,
+        store,
+        Options {
+            config_path: Some(global.config.clone()),
+            interrupted: previous,
+            ..Options::default()
+        },
+    )
+    .map_err(|e| match e {
         soteria_agent::AgentError::Rules(e) => {
             Failure::new(ExitStatus::ConfigInvalid, e.to_string())
                 .hint("check them with 'soteria rules validate'")

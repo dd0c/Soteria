@@ -14,6 +14,8 @@ pub mod lifecycle;
 mod notify;
 pub mod retention;
 pub mod rules;
+pub mod scope;
+pub mod selfcheck;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -90,6 +92,11 @@ pub struct Options {
     /// Join the kernel audit stream for executions. Tests that feed
     /// executions directly turn it off.
     pub exec_sensor: bool,
+    /// The configuration file in use, monitored as one of Soteria's own
+    /// files (FR-036). `None`: the default location.
+    pub config_path: Option<PathBuf>,
+    /// The previous run did not stop cleanly (FR-037): raise SELF-002.
+    pub interrupted: Option<selfcheck::Interruption>,
 }
 
 impl Default for Options {
@@ -100,6 +107,8 @@ impl Default for Options {
             max_delay: Duration::from_millis(1500),
             startup_scan: true,
             exec_sensor: true,
+            config_path: None,
+            interrupted: None,
         }
     }
 }
@@ -162,26 +171,41 @@ pub struct Agent {
     next_retention: Instant,
     /// Email and webhook delivery, when enabled.
     notifier: Option<notify::Notifier>,
+    /// Soteria's own files (FR-036).
+    own_files: Vec<PathBuf>,
 }
 
 impl Agent {
     /// Start sensors and record what is and is not being monitored, so no
     /// capability is shown as active when it is not (SRS 4.7).
     pub fn start(config: Config, store: Store, options: Options) -> Result<Agent> {
-        let scope = Scope {
-            include: config.paths.include.clone(),
-            exclude: config.paths.exclude.clone(),
-        };
+        let scope = scope::for_config(&config, options.config_path.as_deref());
         // Invalid rules stop the agent: running without them would silently
         // weaken detection (FR-043).
         let rules = Arc::new(RuleSet::load(&config.general.rules_directory)?);
         rules::sync(store.connection(), &rules)?;
+        if let Some(i) = &options.interrupted {
+            selfcheck::report(
+                &store,
+                &soteria_platform::hostname(),
+                i,
+                Policy {
+                    minimum: config.alerts.minimum_severity,
+                    rules: &rules,
+                },
+            )?;
+        }
         let now_i = Instant::now();
         let startup_scan = options.startup_scan && config.scanning.startup_scan;
         let mut agent = Agent {
             rules,
             // Not at once: the startup scan comes first.
             next_retention: now_i + RETENTION_FIRST,
+            own_files: if config.paths.own_files {
+                scope::self_paths(&config, options.config_path.as_deref())
+            } else {
+                Vec::new()
+            },
             notifier: notify::Notifier::start(&config, &soteria_platform::hostname(), &store)?,
             next_full: if startup_scan {
                 now_i
@@ -592,6 +616,7 @@ impl Agent {
             source,
             baseline_version: version,
             hostname: &self.hostname,
+            own_file: scope::is_self_path(&self.own_files, &change.path),
         };
         if let Raised::Created { id, .. } = alerts::raise(
             self.store.connection(),

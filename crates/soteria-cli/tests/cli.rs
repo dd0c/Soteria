@@ -56,6 +56,11 @@ impl Env {
             start..end,
             &format!("include = [{:?}]", self.root().to_str().unwrap()),
         );
+        // Nor the real homes, nor the test binary.
+        let start = text.find("persistence = [").unwrap();
+        let end = start + text[start..].find(']').unwrap() + 1;
+        text.replace_range(start..end, "persistence = []");
+        text = text.replace("own_files = true", "own_files = false");
         std::fs::write(&self.config, format!("{text}{extra}")).unwrap();
     }
 

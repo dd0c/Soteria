@@ -42,6 +42,21 @@ include = [
   "/usr/local/sbin"
 ]
 exclude = ["/proc", "/sys", "/dev", "/run"]
+# Persistence locations outside the include list (FR-020): SSH keys, shell
+# startup files, per-user units and autostart entries, cron and at spools.
+# `*` and `?` match within one path component. Missing ones are skipped
+# silently; homes created later are picked up at the next restart.
+persistence = [
+  "/root/.ssh", "/root/.bashrc", "/root/.bash_profile", "/root/.profile",
+  "/root/.zshrc", "/root/.config/systemd/user", "/root/.config/autostart",
+  "/home/*/.ssh", "/home/*/.bashrc", "/home/*/.bash_profile",
+  "/home/*/.bash_login", "/home/*/.profile", "/home/*/.zshrc",
+  "/home/*/.zprofile", "/home/*/.config/systemd/user",
+  "/home/*/.config/autostart", "/var/spool/cron", "/var/spool/at"
+]
+# Monitor Soteria's own program, configuration, rules, keys, audit rule and
+# unit files; any change raises a critical SELF-001 alert (FR-036).
+own_files = true
 
 [execution]
 # Command-line arguments stored with each execution (NFR-011):

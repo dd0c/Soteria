@@ -581,6 +581,7 @@ mod tests {
         let scope = Scope {
             include: vec![f.root.clone()],
             exclude: vec![],
+            optional: Vec::new(),
         };
         scan::run(&mut f.store, &scope, &ScanTarget::Full, "full").unwrap();
     }

@@ -185,6 +185,28 @@ pub const BUILTIN: &[Builtin] = &[
                          modified scripts run by interpreters are a common persistence and execution technique.",
     },
     Builtin {
+        id: "SELF-001",
+        title: "Soteria's own files changed",
+        category: Category::Integrity,
+        severity: Some(Severity::Critical),
+        severity_note: None,
+        description: "One of Soteria's own files (program, configuration, rules, keys, audit rule or unit) changed.",
+        recommendation: "Confirm an administrator made this change (package upgrade, configuration edit). \
+                         An unexplained change may be an attempt to blind or reconfigure monitoring: check who had \
+                         root access, compare with the package (rpm -V soteria / dpkg --verify soteria), and approve \
+                         a new baseline only once explained.",
+    },
+    Builtin {
+        id: "SELF-002",
+        title: "Monitoring was interrupted",
+        category: Category::Integrity,
+        severity: Some(Severity::Medium),
+        severity_note: None,
+        description: "The agent did not stop cleanly last time; changes made while it was down are only found by the startup scan.",
+        recommendation: "Check the journal (journalctl -u soteria) for a crash or kill around the reported time, \
+                         and whether the host was rebooted. A deliberately killed agent can hide activity.",
+    },
+    Builtin {
         id: "INT-001",
         title: "Baseline failed verification",
         category: Category::Integrity,

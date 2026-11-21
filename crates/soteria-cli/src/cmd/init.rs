@@ -209,8 +209,13 @@ pub fn run(args: &InitArgs, global: &GlobalArgs, out: &Output) -> CmdResult {
     if !out.json {
         println!("      {:<16} scanning configured paths...", "inventory");
     }
-    let report = scan::run(&mut store, &scope(&config), &ScanTarget::Full, "full")
-        .map_err(|e| Failure::new(ExitStatus::Internal, format!("inventory scan failed: {e}")))?;
+    let report = scan::run(
+        &mut store,
+        &scope(&config, &global.config),
+        &ScanTarget::Full,
+        "full",
+    )
+    .map_err(|e| Failure::new(ExitStatus::Internal, format!("inventory scan failed: {e}")))?;
     steps.push(
         "inventory",
         if report.result == ScanResult::Completed {

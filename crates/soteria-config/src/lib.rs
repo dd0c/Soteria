@@ -88,7 +88,36 @@ pub struct Scanning {
 pub struct Paths {
     pub include: Vec<PathBuf>,
     pub exclude: Vec<PathBuf>,
+    /// Persistence locations outside the include list, such as users' SSH
+    /// keys and shell startup files (FR-020). `*` and `?` match within one
+    /// path component. Ones that do not exist are not coverage gaps.
+    pub persistence: Vec<PathBuf>,
+    /// Monitor Soteria's own program, configuration, rules, keys, audit
+    /// rule and unit files (FR-036). Turning it off is reported.
+    pub own_files: bool,
 }
+
+/// Default persistence locations (FR-020).
+pub const DEFAULT_PERSISTENCE: &[&str] = &[
+    "/root/.ssh",
+    "/root/.bashrc",
+    "/root/.bash_profile",
+    "/root/.profile",
+    "/root/.zshrc",
+    "/root/.config/systemd/user",
+    "/root/.config/autostart",
+    "/home/*/.ssh",
+    "/home/*/.bashrc",
+    "/home/*/.bash_profile",
+    "/home/*/.bash_login",
+    "/home/*/.profile",
+    "/home/*/.zshrc",
+    "/home/*/.zprofile",
+    "/home/*/.config/systemd/user",
+    "/home/*/.config/autostart",
+    "/var/spool/cron",
+    "/var/spool/at",
+];
 
 /// Email and webhook delivery settings (FR-031). Delivery is switched on by
 /// `alerts.email` and `alerts.webhook`.
@@ -357,6 +386,8 @@ impl Default for Paths {
         Paths {
             include: include.iter().map(PathBuf::from).collect(),
             exclude: exclude.iter().map(PathBuf::from).collect(),
+            persistence: DEFAULT_PERSISTENCE.iter().map(PathBuf::from).collect(),
+            own_files: true,
         }
     }
 }
@@ -627,6 +658,25 @@ impl Config {
         }
         for (i, path) in p.exclude.iter().enumerate() {
             v.absolute_path(&format!("paths.exclude[{i}]"), path);
+        }
+        if !p.own_files {
+            v.warning(
+                "paths.own_files",
+                "Soteria's own files are not monitored; tampering with its program or configuration goes unnoticed",
+            );
+        }
+        for (i, path) in p.persistence.iter().enumerate() {
+            let field = format!("paths.persistence[{i}]");
+            v.absolute_path(&field, path);
+            if path
+                .components()
+                .any(|c| c.as_os_str().to_string_lossy().contains("**"))
+            {
+                v.error(
+                    &field,
+                    "`**` is not supported; `*` matches within one path component",
+                );
+            }
         }
 
         // [execution]
@@ -969,6 +1019,8 @@ mod tests {
             paths: Paths {
                 include: vec![dir.path().to_owned(), missing],
                 exclude: vec![],
+                persistence: vec![],
+                own_files: true,
             },
             ..Config::default()
         };

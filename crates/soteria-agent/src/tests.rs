@@ -34,6 +34,8 @@ fn fixture() -> Fixture {
     let mut config = Config::default();
     config.general.database = db.clone();
     config.paths.include = vec![root.clone()];
+    config.paths.persistence = vec![];
+    config.paths.own_files = false;
     config.paths.exclude = vec![];
     config.baseline.signing_key = sk.clone();
     config.baseline.public_key = pk;
@@ -46,6 +48,7 @@ fn fixture() -> Fixture {
     let scope = Scope {
         include: config.paths.include.clone(),
         exclude: vec![],
+        optional: Vec::new(),
     };
     scan::run(&mut store, &scope, &ScanTarget::Full, "full").unwrap();
     let draft = baseline::create_draft(&mut store, "test", None).unwrap();
@@ -277,6 +280,8 @@ fn without_baseline_changes_are_recorded_but_not_alerted() {
     config.general.database = dir.path().join("db");
     config.general.rules_directory = dir.path().join("rules.d");
     config.paths.include = vec![root.clone()];
+    config.paths.persistence = vec![];
+    config.paths.own_files = false;
     config.paths.exclude = vec![];
     let (store, _) = Store::create_or_migrate(&config.general.database).unwrap();
     let mut agent = Agent::start(config, store, quiet()).unwrap();
@@ -499,6 +504,8 @@ fn without_baseline_executions_are_unverified() {
     config.general.database = dir.path().join("db");
     config.general.rules_directory = dir.path().join("rules.d");
     config.paths.include = vec![dir.path().to_owned()];
+    config.paths.persistence = vec![];
+    config.paths.own_files = false;
     config.execution.unusual_paths = vec![];
     let (store, _) = Store::create_or_migrate(&config.general.database).unwrap();
     let mut agent = Agent::start(config, store, quiet()).unwrap();

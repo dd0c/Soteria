@@ -114,33 +114,8 @@ impl Watcher {
     fn watch_tree(&mut self, dir: &Path, announce: bool) {
         let mut stack = vec![dir.to_owned()];
         while let Some(d) = stack.pop() {
-            if self.scope.is_excluded(&d) {
+            if self.scope.is_excluded(&d) || !self.watch(&d) {
                 continue;
-            }
-            match self.inotify.watches().add(&d, MASK) {
-                Ok(wd) => {
-                    if self.dirs.insert(wd, d.clone()).is_none() {
-                        self.stats.watches.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-                Err(e) => {
-                    // ENOTDIR (ONLYDIR) or a vanished path are not failures.
-                    if matches!(e.raw_os_error(), Some(20) | Some(2)) {
-                        continue;
-                    }
-                    self.stats.watch_failures.fetch_add(1, Ordering::Relaxed);
-                    let detail = if e.raw_os_error() == Some(28) {
-                        "inotify watch limit reached (raise fs.inotify.max_user_watches)".to_owned()
-                    } else {
-                        e.to_string()
-                    };
-                    if let Ok(mut u) = self.stats.unwatched.lock()
-                        && u.len() < UNWATCHED_DETAIL_LIMIT
-                    {
-                        u.push((d.clone(), detail));
-                    }
-                    continue;
-                }
             }
             let Ok(entries) = std::fs::read_dir(&d) else {
                 continue; // reported by scans as an inaccessible path
@@ -157,6 +132,37 @@ impl Watcher {
                 if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                     stack.push(path);
                 }
+            }
+        }
+    }
+
+    /// Watch one directory, without what is below it. False when it could
+    /// not be watched.
+    fn watch(&mut self, d: &Path) -> bool {
+        match self.inotify.watches().add(d, MASK) {
+            Ok(wd) => {
+                if self.dirs.insert(wd, d.to_owned()).is_none() {
+                    self.stats.watches.fetch_add(1, Ordering::Relaxed);
+                }
+                true
+            }
+            Err(e) => {
+                // ENOTDIR (ONLYDIR) or a vanished path are not failures.
+                if matches!(e.raw_os_error(), Some(20) | Some(2)) {
+                    return false;
+                }
+                self.stats.watch_failures.fetch_add(1, Ordering::Relaxed);
+                let detail = if e.raw_os_error() == Some(28) {
+                    "inotify watch limit reached (raise fs.inotify.max_user_watches)".to_owned()
+                } else {
+                    e.to_string()
+                };
+                if let Ok(mut u) = self.stats.unwatched.lock()
+                    && u.len() < UNWATCHED_DETAIL_LIMIT
+                {
+                    u.push((d.to_owned(), detail));
+                }
+                false
             }
         }
     }
@@ -206,7 +212,10 @@ impl Watcher {
                     Some(name) => dir.join(name),
                     None => dir.clone(), // DELETE_SELF / MOVE_SELF / ATTRIB on the dir
                 };
-                if self.scope.is_excluded(&path) {
+                // Directories watched only for a monitored file in them
+                // (such as a home directory for its .bashrc) report
+                // everything; only what is in scope goes on.
+                if !self.scope.contains(&path) {
                     continue;
                 }
                 if event.mask.contains(EventMask::ISDIR)
@@ -260,6 +269,12 @@ pub fn spawn(
     for root in scope.roots() {
         if root.is_dir() {
             watcher.watch_tree(&root, false);
+        } else if let Some(parent) = root.parent()
+            && parent.is_dir()
+        {
+            // A file, or a path that may appear later: its directory
+            // reports creation, changes and removal.
+            watcher.watch(parent);
         }
     }
     stats.running.store(true, Ordering::Relaxed);
@@ -304,6 +319,7 @@ mod tests {
         let scope = Scope {
             include: vec![root.clone()],
             exclude: exclude.iter().map(|e| root.join(e)).collect(),
+            optional: Vec::new(),
         };
         let (tx, rx) = sync_channel(capacity);
         let stop = Arc::new(AtomicBool::new(false));
@@ -409,6 +425,43 @@ mod tests {
         let s = h.stats.snapshot();
         assert!(s.dropped > 0, "{s:?}");
         assert!(s.received > s.dropped);
+    }
+
+    #[test]
+    fn optional_files_and_later_directories_are_watched_through_their_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("alice");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join(".bashrc"), b"a").unwrap();
+        let scope = Scope {
+            include: Vec::new(),
+            exclude: Vec::new(),
+            optional: vec![home.join(".bashrc"), home.join(".ssh")],
+        };
+        let (tx, rx) = sync_channel(1024);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stats = Arc::new(SensorStats::default());
+        let handle = spawn(scope, tx, Arc::clone(&stop), Arc::clone(&stats)).unwrap();
+        std::fs::write(home.join("unrelated"), b"x").unwrap();
+        std::fs::write(home.join(".bashrc"), b"b").unwrap();
+        std::fs::create_dir(home.join(".ssh")).unwrap();
+        let keys = home.join(".ssh/authorized_keys");
+        let mut seen = BTreeSet::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !seen.contains(&keys) {
+            if let Ok(FsEvent::Changed(p)) = rx.recv_timeout(Duration::from_millis(100)) {
+                seen.insert(p);
+            }
+            if seen.contains(&home.join(".ssh")) && !keys.exists() {
+                std::thread::sleep(Duration::from_millis(50));
+                std::fs::write(&keys, b"ssh-ed25519 AAAA").unwrap();
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+        assert!(seen.contains(&home.join(".bashrc")), "{seen:?}");
+        assert!(seen.contains(&keys), "{seen:?}");
+        assert!(!seen.contains(&home.join("unrelated")), "{seen:?}");
     }
 
     #[test]

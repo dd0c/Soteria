@@ -455,6 +455,7 @@ mod tests {
         Scope {
             include: vec![root.to_owned()],
             exclude: vec![],
+            optional: Vec::new(),
         }
     }
 
