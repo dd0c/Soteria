@@ -43,6 +43,8 @@ cannot do.
 | M6 | System monitoring and hardening | 6 | FR-019/020, FR-022..027, NFR-008..016 | Config, persistence, account, kernel/boot monitoring, self-integrity, privileged helper with authenticated IPC, SELinux policy module, AppArmor profile, systemd hardening |
 | M7 | Packaging and release | 7 | 9, 11, 12, 13 | RPM (RHEL 9/10), DEB (Debian 13), install/upgrade/remove scripts, container-based test matrix, benchmarks, admin documentation |
 
+Progress: M1 merged (PR #1). M2 in review.
+
 ## Key design choices (proposed)
 
 - **Database:** `rusqlite` with bundled SQLite, so behaviour is identical on all
@@ -83,3 +85,9 @@ cannot do.
    `coverage_gaps` to the tables proposed in SRS 5.6.
 4. `soteria verify` also checks that the agent is alive, using a heartbeat
    the daemon writes to the database.
+5. Configuration gains `[baseline] signing_key` and `public_key` (FR-006).
+6. Baseline comparison ignores ctime-only changes (any chmod, chown or link
+   count change updates ctime), and reports size/mtime/inode changes without
+   any other difference as `metadata_modified` at `info` severity.
+7. Change severities in M2 are fixed defaults; the M5 rule engine makes them
+   configurable (FR-021).

@@ -5,6 +5,8 @@ members = [
     "crates/soteria-config",
     "crates/soteria-platform",
     "crates/soteria-store",
+    "crates/soteria-inventory",
+    "crates/soteria-integrity",
     "crates/soteria-cli",
 ]
 
@@ -19,6 +21,8 @@ soteria-core = { path = "crates/soteria-core" }
 soteria-config = { path = "crates/soteria-config" }
 soteria-platform = { path = "crates/soteria-platform" }
 soteria-store = { path = "crates/soteria-store" }
+soteria-inventory = { path = "crates/soteria-inventory" }
+soteria-integrity = { path = "crates/soteria-integrity" }
 clap = { version = "4.6", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -30,6 +34,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 humantime = "2"
 signal-hook = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+sha2 = "0.10"
+ed25519-dalek = "2.2"
+xattr = "1.5"
+libc = "0.2"
 tempfile = "3"
 assert_cmd = "2"
 predicates = "3"

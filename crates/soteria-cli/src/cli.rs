@@ -109,14 +109,17 @@ pub enum Command {
 
 #[derive(Debug, Args)]
 pub struct InitArgs {
-    /// Do not prompt; only prepare the host and database
-    #[arg(long)]
+    /// Do not prompt; leave the baseline as a draft for later approval
+    #[arg(long, conflicts_with = "yes")]
     pub non_interactive: bool,
+    /// Approve the initial baseline without asking (requires root)
+    #[arg(long)]
+    pub yes: bool,
 }
 
 #[derive(Debug, Args)]
 #[group(multiple = false)]
-pub struct ScanArgs {
+pub struct ScanTargetArgs {
     /// Full inventory scan of all configured paths (default)
     #[arg(long)]
     pub full: bool,
@@ -134,12 +137,24 @@ pub struct ScanArgs {
     pub kernel: bool,
 }
 
+#[derive(Debug, Args)]
+pub struct ScanArgs {
+    #[command(flatten)]
+    pub target: ScanTargetArgs,
+    /// Maximum number of baseline changes to list in text output
+    #[arg(long, default_value_t = 100)]
+    pub limit: usize,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum BaselineCommand {
     /// List baseline versions
     List,
     /// Show one baseline version
-    Show { version: Option<u32> },
+    Show {
+        #[arg(id = "baseline_version", value_name = "VERSION")]
+        version: Option<u32>,
+    },
     /// Build a draft baseline from the current inventory
     Create {
         /// Note recorded with the draft
@@ -147,11 +162,29 @@ pub enum BaselineCommand {
         note: Option<String>,
     },
     /// Review a draft baseline before approval
-    Review { version: Option<u32> },
+    Review {
+        #[arg(id = "baseline_version", value_name = "VERSION")]
+        version: Option<u32>,
+        /// Maximum number of changes to list
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
     /// Approve and seal a draft baseline (requires root)
-    Approve { version: u32 },
-    /// Compare two baseline versions, or a version with the current state
-    Diff { from: u32, to: Option<u32> },
+    Approve {
+        #[arg(id = "baseline_version", value_name = "VERSION")]
+        version: u32,
+        /// Approve without asking for confirmation
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Compare two baseline versions, or a version with the current inventory
+    Diff {
+        from: u32,
+        to: Option<u32>,
+        /// Maximum number of changes to list in text output
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -162,6 +195,9 @@ pub struct InventoryArgs {
     /// Only objects at or below this path
     #[arg(long, value_name = "PATH")]
     pub path: Option<PathBuf>,
+    /// Only objects with this SHA-256
+    #[arg(long)]
+    pub sha256: Option<String>,
     /// Maximum number of rows
     #[arg(long, default_value_t = 100)]
     pub limit: u32,
@@ -291,4 +327,15 @@ pub enum Component {
     Baseline,
     Service,
     Sensors,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn command_definition_is_consistent() {
+        Cli::command().debug_assert();
+    }
 }

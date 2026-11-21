@@ -13,6 +13,7 @@ use soteria_platform::{Platform, ProbeState};
 use soteria_store::{Store, StoreError, Summary};
 
 use crate::cli::GlobalArgs;
+use crate::context::{BaselineCheck, check_latest_baseline};
 use crate::health::{AgentHealth, AgentState, agent_health};
 use crate::output::{CmdResult, Output, Tone};
 
@@ -26,6 +27,7 @@ pub struct StatusReport {
     pub database: DatabaseSection,
     pub baseline: BaselineSection,
     pub integrity: &'static str,
+    pub baseline_seal: Option<BaselineCheck>,
     pub monitoring: Option<AgentHealth>,
     pub indexed_files: Option<u64>,
     pub open_alerts: Option<AlertCounts>,
@@ -207,6 +209,7 @@ fn build(global: &GlobalArgs) -> (StatusReport, ExitStatus) {
     };
     let mut summary: Option<Summary> = None;
     let mut agent = None;
+    let mut seal = None;
     if let Some(cfg) = &config {
         match Store::open_read_only(&cfg.general.database) {
             Ok(store) => match store.summary() {
@@ -214,6 +217,13 @@ fn build(global: &GlobalArgs) -> (StatusReport, ExitStatus) {
                     database.state = "ok";
                     agent = Some(agent_health(&store, &s));
                     summary = Some(s);
+                    seal = Some(match check_latest_baseline(&store, cfg) {
+                        Ok(c) => c,
+                        Err(f) => BaselineCheck::Unverifiable {
+                            version: 0,
+                            reason: f.message,
+                        },
+                    });
                 }
                 Err(e) => {
                     database.state = "error";
@@ -251,12 +261,19 @@ fn build(global: &GlobalArgs) -> (StatusReport, ExitStatus) {
         coverage.open_gaps = s.open_coverage_gaps;
     }
 
+    if matches!(
+        seal,
+        Some(BaselineCheck::Failed { .. }) | Some(BaselineCheck::Unverifiable { .. })
+    ) {
+        exit = exit.worst(ExitStatus::IntegrityFailure);
+    }
+    let sealed_ok = matches!(seal, Some(BaselineCheck::Verified { .. }));
     let running = agent
         .as_ref()
         .is_some_and(|a| a.state == AgentState::Running);
     let protection = if database.state == "not_initialized" {
         Protection::NotInitialized
-    } else if running && baseline.established && coverage.total() == 0 {
+    } else if running && sealed_ok && coverage.total() == 0 {
         Protection::Active
     } else if running {
         Protection::Degraded
@@ -271,12 +288,13 @@ fn build(global: &GlobalArgs) -> (StatusReport, ExitStatus) {
         protection,
         config: config_section,
         database,
-        integrity: if baseline.established {
-            // Sealed-baseline verification arrives with milestone 2.
-            "UNVERIFIED"
-        } else {
-            "NO BASELINE"
+        integrity: match &seal {
+            Some(BaselineCheck::Verified { .. }) => "VERIFIED",
+            Some(BaselineCheck::Failed { .. }) => "FAILED",
+            Some(BaselineCheck::Unverifiable { .. }) => "UNVERIFIABLE",
+            Some(BaselineCheck::None) | None => "NO BASELINE",
         },
+        baseline_seal: seal.clone(),
         baseline,
         monitoring: agent,
         indexed_files: summary.as_ref().map(|s| s.indexed_files),

@@ -47,6 +47,7 @@ pub struct Config {
     pub monitoring: Monitoring,
     pub scanning: Scanning,
     pub paths: Paths,
+    pub baseline: Baseline,
     pub alerts: Alerts,
 }
 
@@ -85,6 +86,24 @@ pub struct Paths {
     pub exclude: Vec<PathBuf>,
 }
 
+/// Baseline signing keys (FR-006). The private key is readable by root only;
+/// the daemon only needs the public key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Baseline {
+    pub signing_key: PathBuf,
+    pub public_key: PathBuf,
+}
+
+impl Default for Baseline {
+    fn default() -> Self {
+        Baseline {
+            signing_key: PathBuf::from("/etc/soteria/keys/baseline.key"),
+            public_key: PathBuf::from("/etc/soteria/keys/baseline.pub"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Alerts {
@@ -102,6 +121,7 @@ impl Default for Config {
             monitoring: Monitoring::default(),
             scanning: Scanning::default(),
             paths: Paths::default(),
+            baseline: Baseline::default(),
             alerts: Alerts::default(),
         }
     }
@@ -429,6 +449,16 @@ impl Config {
         }
         for (i, path) in p.exclude.iter().enumerate() {
             v.absolute_path(&format!("paths.exclude[{i}]"), path);
+        }
+
+        // [baseline]
+        v.absolute_path("baseline.signing_key", &self.baseline.signing_key);
+        v.absolute_path("baseline.public_key", &self.baseline.public_key);
+        if self.baseline.signing_key == self.baseline.public_key {
+            v.error(
+                "baseline.public_key",
+                "the public key must be a different file from the signing key",
+            );
         }
 
         // [alerts]

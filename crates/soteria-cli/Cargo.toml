@@ -18,6 +18,8 @@ soteria-core.workspace = true
 soteria-config.workspace = true
 soteria-platform.workspace = true
 soteria-store.workspace = true
+soteria-inventory.workspace = true
+soteria-integrity.workspace = true
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -26,10 +28,10 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 signal-hook.workspace = true
 chrono.workspace = true
+rusqlite.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
 assert_cmd.workspace = true
 predicates.workspace = true
 serde_json.workspace = true
-rusqlite.workspace = true

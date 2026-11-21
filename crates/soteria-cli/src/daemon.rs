@@ -15,7 +15,7 @@ use soteria_store::Store;
 use tracing::{error, info, warn};
 
 use crate::cli::GlobalArgs;
-use crate::context::{load_config, store_failure};
+use crate::context::{BaselineCheck, check_latest_baseline, load_config, store_failure};
 use crate::health::{HEARTBEAT_INTERVAL_SECS, HEARTBEAT_KEY};
 use crate::output::{CmdResult, Failure};
 use crate::sdnotify;
@@ -55,6 +55,31 @@ pub fn run(global: &GlobalArgs) -> CmdResult {
             "recovered",
             Some(&format!("{interrupted} interrupted scan(s) marked")),
         );
+    }
+
+    // Baseline integrity verification at service startup (FR-032). A failed
+    // seal does not stop the agent, which must keep reporting, but it is
+    // recorded and logged loudly.
+    match check_latest_baseline(&store, &config) {
+        Ok(BaselineCheck::None) => {
+            warn!("no approved baseline; run 'sudo soteria init' to establish one");
+            record_sensor(&store, "baseline", "none", None);
+        }
+        Ok(BaselineCheck::Verified { version }) => {
+            info!(version, "approved baseline verified");
+            record_sensor(&store, "baseline", "verified", Some(&format!("v{version}")));
+        }
+        Ok(BaselineCheck::Failed { version, problems }) => {
+            let detail = format!("v{version}: {}", problems.join("; "));
+            error!("baseline verification FAILED: {detail}");
+            record_sensor(&store, "baseline", "failed", Some(&detail));
+        }
+        Ok(BaselineCheck::Unverifiable { version, reason }) => {
+            let detail = format!("v{version}: {reason}");
+            error!("baseline cannot be verified: {detail}");
+            record_sensor(&store, "baseline", "unverifiable", Some(&detail));
+        }
+        Err(f) => error!("baseline verification error: {}", f.message),
     }
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -98,8 +123,12 @@ pub fn run(global: &GlobalArgs) -> CmdResult {
 }
 
 fn record(store: &Store, state: &str, detail: Option<&str>) {
-    if let Err(e) = store.record_health(AGENT, state, detail) {
-        error!("cannot record agent state '{state}': {e}");
+    record_sensor(store, AGENT, state, detail);
+}
+
+fn record_sensor(store: &Store, sensor: &str, state: &str, detail: Option<&str>) {
+    if let Err(e) = store.record_health(sensor, state, detail) {
+        error!("cannot record {sensor} state '{state}': {e}");
     }
 }
 

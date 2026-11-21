@@ -204,7 +204,7 @@ impl Store {
 
     fn ensure_meta(&self) -> Result<()> {
         if self.meta("host_id")?.is_none() {
-            self.set_meta("host_id", &random_id())?;
+            self.set_meta("host_id", &new_id())?;
             self.set_meta("created_at", &now())?;
         }
         Ok(())
@@ -406,9 +406,9 @@ fn create_private_file(path: &Path) -> Result<()> {
         })
 }
 
-/// 128-bit random identifier from the kernel CSPRNG, hex encoded. Identifies
-/// this host's database for future central management (SRS 4.4).
-fn random_id() -> String {
+/// 128-bit random identifier from the kernel CSPRNG, hex encoded. Used for
+/// the host ID (future central management, SRS 4.4) and scan IDs.
+pub fn new_id() -> String {
     let mut buf = [0u8; 16];
     std::fs::File::open("/dev/urandom")
         .and_then(|mut f| f.read_exact(&mut buf))

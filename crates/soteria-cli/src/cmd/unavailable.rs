@@ -15,7 +15,6 @@ pub fn run(command: &str, milestone: &str) -> CmdResult {
 }
 
 /// Milestone names used in messages, matching docs/IMPLEMENTATION_PLAN.md.
-pub const INVENTORY: &str = "milestone 2 (inventory and baseline)";
 pub const INTEGRITY: &str = "milestone 3 (integrity monitoring)";
 pub const EXECUTION: &str = "milestone 4 (execution monitoring)";
 pub const DETECTION: &str = "milestone 5 (detection and incidents)";

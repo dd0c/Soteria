@@ -121,3 +121,107 @@ fn user_name(uid: u32) -> Option<String> {
         (f.len() >= 3 && f[2].parse::<u32>().ok() == Some(uid)).then(|| f[0].to_owned())
     })
 }
+
+/// Inventory scope from configuration.
+pub fn scope(config: &Config) -> soteria_inventory::Scope {
+    soteria_inventory::Scope {
+        include: config.paths.include.clone(),
+        exclude: config.paths.exclude.clone(),
+    }
+}
+
+/// Open the database for writing (scans, baseline changes).
+pub fn open_store(config: &Config) -> Result<soteria_store::Store, Failure> {
+    soteria_store::Store::open(&config.general.database).map_err(store_failure)
+}
+
+pub fn open_store_read_only(config: &Config) -> Result<soteria_store::Store, Failure> {
+    soteria_store::Store::open_read_only(&config.general.database).map_err(store_failure)
+}
+
+pub fn key_failure(e: soteria_integrity::keys::KeyError) -> Failure {
+    use soteria_integrity::keys::KeyError;
+    let status = match &e {
+        KeyError::PermissionDenied(_) => ExitStatus::PermissionDenied,
+        KeyError::PrivateMissing(_) | KeyError::PublicMissing(_) => ExitStatus::NotInitialized,
+        KeyError::InsecurePermissions { .. } | KeyError::Malformed { .. } => {
+            ExitStatus::IntegrityFailure
+        }
+        _ => ExitStatus::Internal,
+    };
+    Failure::new(status, e.to_string())
+}
+
+pub fn baseline_failure(e: soteria_integrity::baseline::BaselineError) -> Failure {
+    use soteria_integrity::baseline::BaselineError;
+    let status = match &e {
+        BaselineError::NotFound(_) | BaselineError::NotDraft { .. } => ExitStatus::Usage,
+        BaselineError::NoDraft | BaselineError::NoApproved | BaselineError::EmptyInventory => {
+            ExitStatus::NotInitialized
+        }
+        BaselineError::Sqlite(_) => ExitStatus::Internal,
+    };
+    Failure::new(status, e.to_string())
+}
+
+/// Ask a yes/no question on the terminal. Returns None when stdin is not a
+/// terminal, so callers can require an explicit flag instead.
+pub fn confirm(question: &str) -> Option<bool> {
+    use std::io::{BufRead, IsTerminal, Write};
+    if !std::io::stdin().is_terminal() {
+        return None;
+    }
+    print!("{question} [y/N] ");
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line).ok()?;
+    Some(matches!(line.trim(), "y" | "Y" | "yes" | "YES" | "Yes"))
+}
+
+/// Outcome of checking the latest approved baseline's seal.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum BaselineCheck {
+    /// No baseline has been approved yet.
+    None,
+    Verified {
+        version: u32,
+    },
+    Failed {
+        version: u32,
+        problems: Vec<String>,
+    },
+    /// The public key could not be loaded, so nothing was verified.
+    Unverifiable {
+        version: u32,
+        reason: String,
+    },
+}
+
+pub fn check_latest_baseline(
+    store: &soteria_store::Store,
+    config: &Config,
+) -> Result<BaselineCheck, Failure> {
+    use soteria_integrity::{baseline, keys};
+    let Some(latest) = baseline::latest_approved(store).map_err(baseline_failure)? else {
+        return Ok(BaselineCheck::None);
+    };
+    let key = match keys::load_verifier(&config.baseline.public_key) {
+        Ok(k) => k,
+        Err(e) => {
+            return Ok(BaselineCheck::Unverifiable {
+                version: latest.version,
+                reason: e.to_string(),
+            });
+        }
+    };
+    let v = baseline::verify(store, latest.version, &key).map_err(baseline_failure)?;
+    Ok(if v.valid {
+        BaselineCheck::Verified { version: v.version }
+    } else {
+        BaselineCheck::Failed {
+            version: v.version,
+            problems: v.problems,
+        }
+    })
+}
