@@ -28,7 +28,13 @@ logging_log_file(soteria_log_t)
 
 # The service unit, so changing it needs its own permission.
 type soteria_unit_file_t;
-init_unit_file(soteria_unit_file_t)
+# Fedora and RHEL name this interface systemd_unit_file; refpolicy,
+# init_unit_file.
+ifdef(`systemd_unit_file',`
+	systemd_unit_file(soteria_unit_file_t)
+',`
+	init_unit_file(soteria_unit_file_t)
+')
 
 ########################################
 #
