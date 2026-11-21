@@ -62,10 +62,34 @@ impl Output {
 
     pub fn print_json<T: Serialize>(&self, value: &T) {
         let mut out = std::io::stdout().lock();
-        // A closed pipe is not worth a panic.
-        let _ = serde_json::to_writer_pretty(&mut out, value);
-        let _ = writeln!(out);
+        if let Err(e) = serde_json::to_writer_pretty(&mut out, value)
+            .map_err(std::io::Error::from)
+            .and_then(|()| writeln!(out))
+            .and_then(|()| out.flush())
+        {
+            exit_on_write_error(e);
+        }
     }
+}
+
+/// Exit status a shell reports for a process ended by SIGPIPE.
+pub const BROKEN_PIPE_EXIT: i32 = 128 + 13;
+
+/// Write to stdout; see the `print!` macro in `main.rs`.
+pub fn write_stdout(args: std::fmt::Arguments<'_>) {
+    let mut out = std::io::stdout().lock();
+    if let Err(e) = out.write_fmt(args) {
+        exit_on_write_error(e);
+    }
+}
+
+/// End the process for a failed write to stdout.
+pub fn exit_on_write_error(e: std::io::Error) -> ! {
+    if e.kind() == std::io::ErrorKind::BrokenPipe {
+        std::process::exit(BROKEN_PIPE_EXIT);
+    }
+    eprintln!("soteria: error: cannot write output: {e}");
+    std::process::exit(i32::from(ExitStatus::Internal.code()));
 }
 
 /// A command failure with the exit status it maps to.

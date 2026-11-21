@@ -394,7 +394,9 @@ fn show(global: &GlobalArgs, out: &Output, id: u64) -> CmdResult {
         out.print_json(&d);
     } else {
         let mut stdout = std::io::stdout().lock();
-        let _ = write_text(&mut stdout, &d, Some(out));
+        if let Err(e) = write_text(&mut stdout, &d, Some(out)).and_then(|()| stdout.flush()) {
+            crate::output::exit_on_write_error(e);
+        }
     }
     Ok(ExitStatus::Ok)
 }
@@ -504,8 +506,13 @@ fn export(
         details.push(detail(conn, a)?);
     }
 
-    let io =
-        |e: std::io::Error| Failure::new(ExitStatus::Internal, format!("cannot write export: {e}"));
+    let to_stdout = output.is_none();
+    let io = |e: std::io::Error| {
+        if to_stdout && e.kind() == std::io::ErrorKind::BrokenPipe {
+            crate::output::exit_on_write_error(e);
+        }
+        Failure::new(ExitStatus::Internal, format!("cannot write export: {e}"))
+    };
     let mut sink: Box<dyn Write> = match output {
         Some(p) => {
             use std::os::unix::fs::OpenOptionsExt;
