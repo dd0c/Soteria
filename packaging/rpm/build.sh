@@ -14,7 +14,8 @@ trap 'rm -rf "$top"' EXIT
 mkdir -p "$top/SOURCES" "$out"
 git archive --format=tar.gz --prefix="soteria-$version/" -o "$top/SOURCES/soteria-$version.tar.gz" HEAD
 install -m 0755 "$bin" "$top/SOURCES/soteria"
-rpmbuild -bb packaging/rpm/soteria.spec \
+install -m 0644 packaging/sysusers/soteria.conf "$top/SOURCES/soteria.sysusers"
+rpmbuild -bb ${RPMBUILD_FLAGS:-} packaging/rpm/soteria.spec \
 	--define "_topdir $top" \
 	--define "soteria_version $version" \
 	--define "_rpmdir $out" \

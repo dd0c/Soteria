@@ -14,6 +14,7 @@ License:        GPL-3.0-or-later
 URL:            https://github.com/dd0c/Soteria
 Source0:        soteria-%{version}.tar.gz
 Source1:        soteria
+Source2:        soteria.sysusers
 
 BuildRequires:  systemd-rpm-macros
 BuildRequires:  selinux-policy-devel
@@ -56,12 +57,12 @@ install -D -m 0640 packaging/config/soteria.toml %{buildroot}%{_sysconfdir}/sote
 install -d -m 0755 %{buildroot}%{_sysconfdir}/soteria/rules.d
 install -d -m 0750 %{buildroot}%{_sysconfdir}/soteria/keys
 install -D -m 0640 packaging/audit/soteria.rules %{buildroot}%{_sysconfdir}/audit/rules.d/soteria.rules
-install -d -m 0750 %{buildroot}%{_sharedstatedir}/soteria %{buildroot}%{_localstatedir}/log/soteria
+install -d -m 0750 %{buildroot}/var/lib/soteria %{buildroot}%{_localstatedir}/log/soteria
 install -D -m 0644 packaging/selinux/soteria.pp.bz2 %{buildroot}%{_datadir}/selinux/packages/%{selinuxtype}/soteria.pp.bz2
 install -D -m 0644 packaging/selinux/soteria.if %{buildroot}%{_datadir}/selinux/devel/include/distributed/soteria.if
 
 %pre
-%sysusers_create_compat packaging/sysusers/soteria.conf
+%{?sysusers_create_compat:%sysusers_create_compat %{SOURCE2}}
 
 %post
 %systemd_post soteria.service
@@ -121,7 +122,7 @@ fi
 %dir %{_sysconfdir}/soteria/rules.d
 %dir %attr(0750,root,soteria) %{_sysconfdir}/soteria/keys
 %config(noreplace) %{_sysconfdir}/audit/rules.d/soteria.rules
-%dir %attr(0750,soteria,soteria) %{_sharedstatedir}/soteria
+%dir %attr(0750,soteria,soteria) /var/lib/soteria
 %dir %attr(0750,soteria,soteria) %{_localstatedir}/log/soteria
 
 %files selinux
