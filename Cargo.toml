@@ -8,6 +8,8 @@ members = [
     "crates/soteria-inventory",
     "crates/soteria-integrity",
     "crates/soteria-sensors",
+    "crates/soteria-rules",
+    "crates/soteria-notify",
     "crates/soteria-agent",
     "crates/soteria-cli",
 ]
@@ -26,6 +28,8 @@ soteria-store = { path = "crates/soteria-store" }
 soteria-inventory = { path = "crates/soteria-inventory" }
 soteria-integrity = { path = "crates/soteria-integrity" }
 soteria-sensors = { path = "crates/soteria-sensors" }
+soteria-rules = { path = "crates/soteria-rules" }
+soteria-notify = { path = "crates/soteria-notify" }
 soteria-agent = { path = "crates/soteria-agent" }
 clap = { version = "4.6", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
@@ -44,6 +48,10 @@ xattr = "1.5"
 libc = "0.2"
 netlink-sys = { version = "0.8", default-features = false }
 inotify = { version = "0.11", default-features = false }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-native-certs = "0.8"
+rustls-pki-types = { version = "1.12", features = ["std"] }
+rcgen = "0.13"
 tempfile = "3"
 assert_cmd = "2"
 predicates = "3"

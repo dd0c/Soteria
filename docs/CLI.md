@@ -39,15 +39,23 @@ usage > not initialized > unavailable > findings > ok.
 | `soteria scan [--full \| --dir PATH \| --file PATH \| --baseline]` | Inventory scans. `--baseline` first verifies the approved baseline's seal, then rescans and lists every deviation with a severity. `--kernel` arrives with milestone 6. |
 | `soteria inventory [--kind K] [--path P] [--sha256 H] [--limit N]` | Lists indexed objects. |
 | `soteria baseline list\|show\|create\|review\|approve\|diff` | Baseline lifecycle; see below. |
-| `soteria config show\|validate\|default` | Configuration. |
+| `soteria config show\|validate\|default` | Configuration. `validate` also checks the administrator rule files. |
+| `soteria config test-notifications` | Sends a test message to each enabled notification channel; exit 1 if one fails. |
 | `soteria verify [--component config,platform,database,baseline,service,sensors]` | Runs every check and lists each result. Checks that belong to later milestones are listed as `SKIP` with the reason. |
 | `soteria daemon` | Started by `soteria.service`. Runs live monitoring; see below. |
 | `soteria events [--since T] [--until T] [--type TYPE] [--severity S] [--limit N]` | Event history, oldest first (the newest `N` when more match). `T` is an RFC 3339 time or an age such as `30m` or `2h`. `--type file` matches `file.created`, `file.modified` and `file.deleted`. `--severity S` means `S` and above. |
-| `soteria alerts list [--since T] [--until T] [--severity S] [--status S] [--limit N]` | Alerts, newest first. |
+| `soteria alerts list [--since T] [--until T] [--severity S] [--status S] [--rule ID] [--object TEXT] [--incident N] [--limit N]` | Alerts, newest first. |
 | `soteria alerts show ID` | One alert with its evidence (approved and current state, change kinds, source), recommendation and history. |
-| `soteria alerts ack\|investigate\|note\|suppress\|export` | Milestone 5. Exit 7 until then. |
+| `soteria alerts ack\|investigate\|close\|reopen ID [--note TEXT]` | Change an alert's status; see [Alert handling](#alert-handling). |
+| `soteria alerts note ID TEXT` | Add a note to an alert's history. |
+| `soteria alerts suppress ID --reason TEXT [--all-objects] [--expires AGE]` | Stop raising this detection (rule on this object, or on every object). |
+| `soteria alerts suppressions [--all]`, `alerts unsuppress SID` | List or remove suppressions. |
+| `soteria alerts incidents [--all]`, `alerts incident N` | Groups of related alerts; see [Incidents](#incidents). |
+| `soteria alerts export [--format json\|csv\|text] [filters] [--output FILE]` | Alerts with evidence and history (FR-035). A file is created with mode 0600. |
 | `soteria processes [--since T] [--until T] [--exe NAME\|PATH] [--user USER\|UID] [--pid N] [--severity S] [--classification C] [--limit N]` | Execution history (FR-013), oldest first (the newest `N` when more match). `--exe` with a `/` matches the program or script path, or everything under a directory; without one it matches the program name. `--user` matches the real, effective or login user. |
-| `soteria rules`, `report` | Milestone 5. Exit 7 until then. |
+| `soteria rules list\|show ID\|validate` | Detection rules in effect; see [Detection rules](#detection-rules). |
+| `soteria report scan ID\|UUID\|latest`, `report scans [--since T] [--limit N]` | Scan reports (FR-034): type, times, duration, checked, skipped and error counts, changes, baseline deviations, gaps and result. |
+| `soteria report summary [--since T] [--until T]` | Host summary for a period (default 7 days): alerts by severity, status, rule and object, incidents, suppressed detections, executions by classification, file changes, scans, open coverage gaps and notification failures. |
 
 ## Baselines
 
@@ -106,7 +114,9 @@ changes to binaries, libraries, kernel files and security-sensitive files are
   (metadata only), with the severity from the comparison. The same deviation
   is not raised again while its alert is open, acknowledged or investigated.
   Alerts below `alerts.minimum_severity` are not raised; with
-  `alerts.journal = true` each alert is also logged to the journal.
+  `alerts.journal = true` each alert is also logged to the journal. Rules can
+  be disabled or given a fixed severity; see
+  [Detection rules](#detection-rules).
 - **Executions (FR-009..FR-012).** See below.
 - **Not yet monitored.** Kernel, persistence and account monitoring arrive
   in a later milestone. While they are enabled in the
@@ -159,6 +169,95 @@ with secret-like names, and passwords in URLs. `full` keeps everything, and
 Lost executions cannot be recovered by a scan. A full queue or audit
 socket overrun opens an `overflow` coverage gap, which closes after an hour
 without further loss.
+
+## Alert handling
+
+Alerts move between `open`, `acknowledged`, `investigated`, `closed` and
+`suppressed` (FR-030). Every change and note is appended to the alert's
+history with the user who made it (through `sudo`, recorded as
+`root (via sudo from alice)`); the history cannot be edited, and an alert's
+evidence can never change, so acknowledging or closing an alert never alters
+what was detected. Changing an alert needs write access to the database
+(root).
+
+`suppress` records an administrator decision that a detection is benign: the
+alert becomes `suppressed`, and matching detections (the same rule on the
+same object, or with `--all-objects` on any object) are recorded as
+`alert.suppressed` events instead of alerts, until the suppression expires
+(`--expires 30d`) or is removed. Suppressions are listed with
+`alerts suppressions`. Removing one does not change the alerts it
+suppressed.
+
+`export` writes all matching alerts, oldest first, with evidence and
+history. CSV cells that start with `=`, `+`, `-`, `@`, a tab or a carriage return are
+prefixed with `'`
+so spreadsheets do not run them as formulas.
+
+## Incidents
+
+Related alerts are grouped into incidents (FR-018). Two alerts are related
+when they were raised within `alerts.correlation_window` (default 1 hour) of
+each other and:
+
+- concern the same file or program;
+- one is a file change and the other an execution of that file (for example
+  a program written to `/usr/local/bin` and then run);
+- are executions in the same login session by the same login user; or
+- one execution is the parent process of the other.
+
+A single alert is not an incident; the second related alert creates one, and
+later related alerts join it. The incident's severity is the highest of its
+alerts, and it closes when all its alerts are closed or suppressed (a new
+related alert reopens it). Grouping is noted in each alert's history.
+Notifications include the incident number.
+
+## Detection rules
+
+`soteria rules list` shows every rule with its state and severity, and
+`rules show ID` explains when it fires and how to investigate. Built-in rules
+are `FIM-001` to `FIM-011` (file integrity), `EXE-001` to `EXE-005`
+(execution) and `INT-001` (baseline seal). Administrators add rules and
+overrides in `*.toml` files in `general.rules_directory` (default
+`/etc/soteria/rules.d`); see [RULES.md](RULES.md). Invalid rule files fail
+`soteria config validate` and `rules validate` (exit 3), and the daemon
+refuses to start with them rather than run with rules missing. Rule
+definitions and versions are recorded in the database when the daemon
+starts. Restart the daemon to apply changes.
+
+## Notifications
+
+Besides the journal, new alerts can be sent by email and to a webhook
+(FR-031). Both are off by default and switched on with `alerts.email` and
+`alerts.webhook`; settings are in `[notifications.email]` and
+`[notifications.webhook]`.
+
+- **Email** goes to an SMTP relay, always encrypted: `tls = "starttls"`
+  (port 587 unless given) or `"implicit"` (port 465). A relay that does not
+  offer STARTTLS is refused rather than used in the clear. A login uses
+  `AUTH PLAIN` with the password read from `password_file`.
+- **Webhooks** receive a JSON `POST` over HTTPS:
+  `{"source": "soteria", "version", "hostname", "alerts": [...]}`, each alert
+  with id, uuid, time, severity, type, status, host, object, rule, reason,
+  recommendation and incident. `token_file` adds `Authorization: Bearer`.
+  Any 2xx answer counts as delivered; redirects are not followed.
+
+Certificates are checked against the system trust store, or `ca_file`.
+Each channel has its own `minimum_severity` (default `high`), sends up to 50
+alerts per message, and remembers in the database the last alert it
+delivered, so restarts neither lose nor repeat alerts. Only alerts raised
+after a channel is switched on are sent. Delivery runs on its own thread, so
+a slow or unreachable server never delays monitoring. A failed attempt is
+logged, recorded as a `notification.failed` event, shown as `failing` in
+`soteria status`, and retried after 30 seconds, doubling up to 30 minutes.
+`soteria config test-notifications` sends a test message.
+
+## Retention
+
+Every hour the daemon deletes events and execution records older than
+`general.event_retention_days` (default 90), and records a
+`retention.pruned` event. Alerts, their history, incidents, suppressions,
+baselines and scan reports are kept, and so are the events and execution
+records an alert cites.
 
 ## Agent liveness
 

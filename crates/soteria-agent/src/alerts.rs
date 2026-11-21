@@ -13,7 +13,27 @@ use serde_json::{Value, json};
 use soteria_core::Severity;
 use soteria_integrity::compare::{Change, ChangeKind};
 use soteria_inventory::{FileRecord, hex, sha256_hex};
+use soteria_rules::RuleSet;
 use soteria_store::{new_id, now};
+
+/// What decides whether a detection becomes an alert: the minimum severity
+/// and the rules in effect (overrides and administrator rules).
+#[derive(Debug, Clone, Copy)]
+pub struct Policy<'r> {
+    pub minimum: Severity,
+    pub rules: &'r RuleSet,
+}
+
+/// Built-in rules only, with a minimum severity (tests and tools).
+impl From<Severity> for Policy<'static> {
+    fn from(minimum: Severity) -> Self {
+        static BUILTIN: std::sync::OnceLock<RuleSet> = std::sync::OnceLock::new();
+        Policy {
+            minimum,
+            rules: BUILTIN.get_or_init(RuleSet::builtin),
+        }
+    }
+}
 
 /// Statuses that count as unresolved for de-duplication.
 const UNRESOLVED: &str = "('open', 'acknowledged', 'investigated')";
@@ -42,77 +62,21 @@ impl Source {
     }
 }
 
-/// Rule, reason and guidance for a change, keyed on its most significant kind.
-struct RuleText {
-    id: &'static str,
-    reason: &'static str,
-    recommendation: &'static str,
-}
-
-fn rule_for(kind: ChangeKind) -> RuleText {
-    match kind {
-        ChangeKind::New => RuleText {
-            id: "FIM-001",
-            reason: "Object is not part of the approved baseline.",
-            recommendation: "Identify what created it and when (package install, deployment, or an unknown process). \
-                             Check its owner, permissions and content; approve it into a new baseline only if authorized.",
-        },
-        ChangeKind::Missing => RuleText {
-            id: "FIM-002",
-            reason: "Object in the approved baseline no longer exists.",
-            recommendation: "Determine whether it was removed by package maintenance or deliberately deleted. \
-                             Missing security tooling or logs can indicate anti-forensics.",
-        },
-        ChangeKind::TypeChanged => RuleText {
-            id: "FIM-010",
-            reason: "Object type changed (for example, a file replaced by a symlink).",
-            recommendation: "Replacing files with links is a common way to redirect execution or reads. \
-                             Inspect the new object and what it points to.",
-        },
-        ChangeKind::ContentModified => RuleText {
-            id: "FIM-003",
-            reason: "File content differs from the approved baseline.",
-            recommendation: "Verify package provenance (rpm -V / dpkg --verify), review change history, \
-                             and determine whether this change was authorized.",
-        },
-        ChangeKind::PermissionModified => RuleText {
-            id: "FIM-004",
-            reason: "Permissions differ from the approved baseline.",
-            recommendation: "Check for added setuid/setgid bits or write access for other users, \
-                             which can enable privilege escalation.",
-        },
-        ChangeKind::OwnerModified => RuleText {
-            id: "FIM-005",
-            reason: "Owner or group differs from the approved baseline.",
-            recommendation: "Confirm the new owner is expected; ownership by an unprivileged user lets that user modify the file.",
-        },
-        ChangeKind::CapabilityModified => RuleText {
-            id: "FIM-006",
-            reason: "File capabilities differ from the approved baseline.",
-            recommendation: "Review the capabilities with getcap; added capabilities grant privileges without setuid.",
-        },
-        ChangeKind::SecurityLabelModified => RuleText {
-            id: "FIM-007",
-            reason: "Security label (SELinux context) differs from the approved baseline.",
-            recommendation: "Check the context with ls -Z and restorecon -n; a changed label can bypass MAC policy.",
-        },
-        ChangeKind::SymlinkTargetModified => RuleText {
-            id: "FIM-008",
-            reason: "Symbolic link points somewhere other than in the approved baseline.",
-            recommendation: "Inspect the new target; redirected links can substitute binaries or configuration.",
-        },
-        ChangeKind::ExecutableStatusModified => RuleText {
-            id: "FIM-009",
-            reason: "Executable permission changed compared with the approved baseline.",
-            recommendation: "Determine why the object became (non-)executable and whether it has since been run.",
-        },
-        ChangeKind::MetadataModified => RuleText {
-            id: "FIM-011",
-            reason: "File metadata (size, time or inode) changed without a content or permission change.",
-            recommendation: "Usually benign (for example, a file rewritten with identical content). \
-                             Correlate with maintenance activity.",
-        },
-    }
+/// The built-in rule for a change, keyed on its most significant kind.
+fn rule_for(kind: ChangeKind) -> &'static soteria_rules::Builtin {
+    soteria_rules::builtin(match kind {
+        ChangeKind::New => "FIM-001",
+        ChangeKind::Missing => "FIM-002",
+        ChangeKind::TypeChanged => "FIM-010",
+        ChangeKind::ContentModified => "FIM-003",
+        ChangeKind::PermissionModified => "FIM-004",
+        ChangeKind::OwnerModified => "FIM-005",
+        ChangeKind::CapabilityModified => "FIM-006",
+        ChangeKind::SecurityLabelModified => "FIM-007",
+        ChangeKind::SymlinkTargetModified => "FIM-008",
+        ChangeKind::ExecutableStatusModified => "FIM-009",
+        ChangeKind::MetadataModified => "FIM-011",
+    })
 }
 
 /// Order of significance used to pick the rule for a multi-kind change.
@@ -175,6 +139,12 @@ pub enum Raised {
     },
     /// Below the configured minimum severity; recorded as an event only.
     BelowThreshold,
+    /// Matched an administrator's suppression; recorded as an event only.
+    Suppressed {
+        suppression: i64,
+    },
+    /// The rule is disabled by an administrator override.
+    Disabled,
 }
 
 /// Any alert, before de-duplication and threshold checks.
@@ -196,9 +166,30 @@ pub struct AlertSpec<'a> {
 
 /// Record an alert unless it is below `minimum` or an unresolved alert for
 /// the same object, rule and identity exists.
-pub fn insert(conn: &Connection, a: AlertSpec<'_>, minimum: Severity) -> rusqlite::Result<Raised> {
-    if a.severity < minimum {
+pub fn insert<'r>(
+    conn: &Connection,
+    a: AlertSpec<'_>,
+    policy: impl Into<Policy<'r>>,
+) -> rusqlite::Result<Raised> {
+    let policy = policy.into();
+    // Built-in rules can be disabled or given a fixed severity.
+    let Some(severity) = policy.rules.effective(a.rule_id, a.severity) else {
+        return Ok(Raised::Disabled);
+    };
+    if severity < policy.minimum {
         return Ok(Raised::BelowThreshold);
+    }
+    // A suppressed detection is kept as an event, not an alert (FR-030).
+    if let Some(suppression) = crate::lifecycle::suppressed_by(conn, a.rule_id, a.object)? {
+        record_event(
+            conn,
+            "detection",
+            "alert.suppressed",
+            severity,
+            None,
+            &json!({ "rule": a.rule_id, "object": a.object, "suppression": suppression }),
+        )?;
+        return Ok(Raised::Suppressed { suppression });
     }
     let fingerprint = sha256_hex(
         json!({ "object": a.object, "rule": a.rule_id, "after": a.identity })
@@ -234,7 +225,7 @@ pub fn insert(conn: &Connection, a: AlertSpec<'_>, minimum: Severity) -> rusqlit
         params![
             uuid,
             ts,
-            a.severity.as_str(),
+            severity.as_str(),
             a.alert_type,
             a.hostname,
             a.object,
@@ -264,9 +255,16 @@ pub fn insert(conn: &Connection, a: AlertSpec<'_>, minimum: Severity) -> rusqlit
     }
 }
 
-/// Record an alert for a baseline deviation, unless it is a duplicate or
-/// below `minimum`.
-pub fn raise(conn: &Connection, a: &NewAlert<'_>, minimum: Severity) -> rusqlite::Result<Raised> {
+/// Record an alert for a baseline deviation under its built-in rule, and
+/// one for each administrator file rule it matches, unless duplicate,
+/// disabled, suppressed or below the minimum. Returns the built-in rule's
+/// outcome.
+pub fn raise<'r>(
+    conn: &Connection,
+    a: &NewAlert<'_>,
+    policy: impl Into<Policy<'r>>,
+) -> rusqlite::Result<Raised> {
+    let policy = policy.into();
     let c = a.change;
     let rule = rule_for(primary(&c.kinds));
     let object = String::from_utf8_lossy(c.path.as_os_str().as_bytes()).into_owned();
@@ -274,9 +272,9 @@ pub fn raise(conn: &Connection, a: &NewAlert<'_>, minimum: Severity) -> rusqlite
     let after = c.after.as_ref().map(state_json);
     let kinds: Vec<&str> = c.kinds.iter().map(|k| k.as_str()).collect();
     let reason = if c.kinds.len() > 1 {
-        format!("{} Also changed: {}.", rule.reason, kinds.join(", "))
+        format!("{} Also changed: {}.", rule.description, kinds.join(", "))
     } else {
-        rule.reason.to_owned()
+        rule.description.to_owned()
     };
     let evidence = json!({
         "source": a.source.as_str(),
@@ -286,7 +284,8 @@ pub fn raise(conn: &Connection, a: &NewAlert<'_>, minimum: Severity) -> rusqlite
         "current": after,
         "actor": "unknown: filesystem events do not identify the process",
     });
-    insert(
+    let identity = after.unwrap_or(Value::Null);
+    let raised = insert(
         conn,
         AlertSpec {
             alert_type: "file_integrity",
@@ -296,12 +295,36 @@ pub fn raise(conn: &Connection, a: &NewAlert<'_>, minimum: Severity) -> rusqlite
             object: &object,
             reason: &reason,
             recommendation: rule.recommendation,
-            evidence,
-            identity: after.unwrap_or(Value::Null),
+            evidence: evidence.clone(),
+            identity: identity.clone(),
             event_id: None,
         },
-        minimum,
-    )
+        policy,
+    )?;
+    for admin in policy
+        .rules
+        .file_matches(c.path.as_os_str().as_bytes(), &kinds)
+    {
+        let mut evidence = evidence.clone();
+        evidence["builtin_rule"] = json!(rule.id);
+        insert(
+            conn,
+            AlertSpec {
+                alert_type: "file_integrity",
+                rule_id: &admin.id,
+                severity: admin.severity_for(c.severity),
+                hostname: a.hostname,
+                object: &object,
+                reason: admin.reason.as_deref().unwrap_or(&reason),
+                recommendation: &admin.recommendation,
+                evidence,
+                identity: identity.clone(),
+                event_id: None,
+            },
+            policy,
+        )?;
+    }
+    Ok(raised)
 }
 
 /// Record a raw event (sensor observation or system activity).

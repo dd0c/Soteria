@@ -9,6 +9,11 @@
 pub mod alerts;
 pub mod exec;
 mod exec_sensor;
+pub mod incidents;
+pub mod lifecycle;
+mod notify;
+pub mod retention;
+pub mod rules;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -28,12 +33,18 @@ use soteria_integrity::compare::{Change, ChangeKind, ChangeSummary, diff_record,
 use soteria_integrity::keys;
 use soteria_integrity::scan::{self, ScanTarget, delete_file, load_file, upsert_file};
 use soteria_inventory::{Scope, inspect_path};
+use soteria_rules::RuleSet;
 use soteria_sensors::audit::{self as exec_audit, AuditSnapshot};
 use soteria_sensors::fs::{self as fs_sensor, FsEvent, SensorStats, StatsSnapshot};
 use soteria_store::{Store, now};
 use tracing::{error, info, warn};
 
-use alerts::{NewAlert, Raised, Source};
+use alerts::{NewAlert, Policy, Raised, Source};
+
+/// How often old events and execution records are deleted.
+const RETENTION_INTERVAL: Duration = Duration::from_secs(3600);
+/// Delay before the first retention run after start.
+const RETENTION_FIRST: Duration = Duration::from_secs(300);
 
 /// Meta key holding the agent's latest health snapshot (FR-039).
 pub const HEALTH_KEY: &str = "agent_health";
@@ -58,6 +69,8 @@ pub enum AgentError {
     Baseline(#[from] baseline::BaselineError),
     #[error(transparent)]
     Scan(#[from] scan::ScanError),
+    #[error(transparent)]
+    Rules(#[from] soteria_rules::RulesError),
 }
 
 pub type Result<T> = std::result::Result<T, AgentError>;
@@ -143,6 +156,12 @@ pub struct Agent {
     executions_processed: u64,
     /// Execution classifier used without a live sensor (tests).
     spare_monitor: Option<exec::ExecMonitor>,
+    /// Detection rules in effect (built-in, overrides, administrator rules).
+    rules: Arc<RuleSet>,
+    /// When old events and execution records are next deleted.
+    next_retention: Instant,
+    /// Email and webhook delivery, when enabled.
+    notifier: Option<notify::Notifier>,
 }
 
 impl Agent {
@@ -153,9 +172,17 @@ impl Agent {
             include: config.paths.include.clone(),
             exclude: config.paths.exclude.clone(),
         };
+        // Invalid rules stop the agent: running without them would silently
+        // weaken detection (FR-043).
+        let rules = Arc::new(RuleSet::load(&config.general.rules_directory)?);
+        rules::sync(store.connection(), &rules)?;
         let now_i = Instant::now();
         let startup_scan = options.startup_scan && config.scanning.startup_scan;
         let mut agent = Agent {
+            rules,
+            // Not at once: the startup scan comes first.
+            next_retention: now_i + RETENTION_FIRST,
+            notifier: notify::Notifier::start(&config, &soteria_platform::hostname(), &store)?,
             next_full: if startup_scan {
                 now_i
             } else {
@@ -364,7 +391,39 @@ impl Agent {
             self.critical_scan()?;
             self.next_critical = Instant::now() + self.config.scanning.critical_scan_interval.0;
         }
+        self.after_alerts()?;
         Ok(())
+    }
+
+    /// Work on alerts recorded since the last step: group related ones into
+    /// incidents (FR-018).
+    pub fn after_alerts(&mut self) -> Result<()> {
+        incidents::correlate_pending(
+            self.store.connection(),
+            self.config.alerts.correlation_window.0,
+        )?;
+        if let Some(n) = self.notifier.as_mut() {
+            n.step(&self.store)?;
+        }
+        if Instant::now() >= self.next_retention {
+            self.prune()?;
+        }
+        Ok(())
+    }
+
+    /// Delete events and execution records past the retention period.
+    pub fn prune(&mut self) -> Result<retention::Pruned> {
+        let days = u64::from(self.config.general.event_retention_days);
+        let pruned = retention::prune(self.store.connection(), Duration::from_secs(days * 86_400))?;
+        if pruned != retention::Pruned::default() {
+            info!(
+                events = pruned.events,
+                processes = pruned.processes,
+                "deleted records older than {days} days"
+            );
+        }
+        self.next_retention = Instant::now() + RETENTION_INTERVAL;
+        Ok(pruned)
     }
 
     /// Verify every pending path now, regardless of settle time.
@@ -537,7 +596,10 @@ impl Agent {
         if let Raised::Created { id, .. } = alerts::raise(
             self.store.connection(),
             &new,
-            self.config.alerts.minimum_severity,
+            Policy {
+                minimum: self.config.alerts.minimum_severity,
+                rules: &self.rules,
+            },
         )? && self.config.alerts.journal
         {
             let kinds: Vec<&str> = change.kinds.iter().map(|k| k.as_str()).collect();
@@ -617,40 +679,31 @@ impl Agent {
     }
 
     fn seal_alert(&mut self, version: u32, detail: &str) -> Result<()> {
-        let conn = self.store.connection();
-        let exists: Option<i64> = conn
-            .query_row(
-                "SELECT id FROM alerts WHERE rule_id = 'INT-001' AND object = ?1
-                 AND status IN ('open', 'acknowledged', 'investigated') LIMIT 1",
-                [format!("baseline v{version}")],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if exists.is_some() {
-            return Ok(());
+        let rule = soteria_rules::builtin("INT-001");
+        let raised = alerts::insert(
+            self.store.connection(),
+            alerts::AlertSpec {
+                alert_type: "baseline_integrity",
+                rule_id: rule.id,
+                severity: Severity::Critical,
+                hostname: &self.hostname,
+                object: &format!("baseline v{version}"),
+                reason: rule.description,
+                recommendation: rule.recommendation,
+                evidence: json!({ "baseline_version": version, "detail": detail }),
+                // One open alert per failed baseline, whatever the detail.
+                identity: json!(null),
+                event_id: None,
+            },
+            // A failed seal is always reported, whatever the minimum.
+            Policy {
+                minimum: Severity::Info,
+                rules: &self.rules,
+            },
+        )?;
+        if let Raised::Created { id, .. } = raised {
+            error!(alert = id, "ALERT {id} [CRITICAL] {detail}");
         }
-        let ts = now();
-        conn.execute(
-            "INSERT INTO alerts (uuid, created_at, updated_at, severity, type, status, hostname, object,
-                                 rule_id, reason, evidence, recommendation)
-             VALUES (?1, ?2, ?2, 'critical', 'baseline_integrity', 'open', ?3, ?4, 'INT-001', ?5, ?6, ?7)",
-            params![
-                soteria_store::new_id(),
-                ts,
-                self.hostname,
-                format!("baseline v{version}"),
-                "The approved baseline failed cryptographic verification.",
-                json!({ "baseline_version": version, "detail": detail }).to_string(),
-                "Treat the database as tampered with until proven otherwise. Compare with an offline copy, \
-                 check who had root access, and re-establish the baseline from a trusted state.",
-            ],
-        )?;
-        let id = conn.last_insert_rowid();
-        conn.execute(
-            "INSERT INTO alert_history (alert_id, ts, actor, action, to_status) VALUES (?1, ?2, 'soteria', 'created', 'open')",
-            params![id, ts],
-        )?;
-        error!(alert = id, "ALERT {id} [CRITICAL] {detail}");
         Ok(())
     }
 
@@ -816,6 +869,9 @@ impl Agent {
     /// Stop the sensor thread and record the shutdown.
     pub fn shutdown(mut self) {
         self.sensor_stop.store(true, Ordering::Relaxed);
+        if let Some(n) = self.notifier.as_mut() {
+            n.shutdown();
+        }
         if let Some(h) = self.sensor.take() {
             let _ = h.join();
         }

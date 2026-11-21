@@ -49,6 +49,7 @@ pub struct Config {
     pub paths: Paths,
     pub execution: Execution,
     pub baseline: Baseline,
+    pub notifications: Notifications,
     pub alerts: Alerts,
 }
 
@@ -58,6 +59,8 @@ pub struct General {
     pub log_level: String,
     pub database: PathBuf,
     pub event_retention_days: u32,
+    /// Administrator detection rules (`*.toml`).
+    pub rules_directory: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,6 +88,120 @@ pub struct Scanning {
 pub struct Paths {
     pub include: Vec<PathBuf>,
     pub exclude: Vec<PathBuf>,
+}
+
+/// Email and webhook delivery settings (FR-031). Delivery is switched on by
+/// `alerts.email` and `alerts.webhook`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Notifications {
+    pub email: Email,
+    pub webhook: Webhook,
+}
+
+/// How the SMTP connection is encrypted. Plain SMTP is not offered:
+/// alerts carry evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SmtpTls {
+    /// Plain connection upgraded with STARTTLS (usually port 587).
+    Starttls,
+    /// TLS from the start (usually port 465).
+    Implicit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Email {
+    /// SMTP relay, `host` or `host:port`.
+    pub relay: String,
+    pub tls: SmtpTls,
+    pub from: String,
+    pub to: Vec<String>,
+    /// SMTP login; empty for none.
+    pub username: String,
+    /// File holding the SMTP password (root-only); required with a username.
+    pub password_file: PathBuf,
+    /// CA certificates (PEM) to trust instead of the system store.
+    pub ca_file: PathBuf,
+    pub minimum_severity: Severity,
+    pub timeout: HumanDuration,
+}
+
+impl Default for Email {
+    fn default() -> Self {
+        Email {
+            relay: String::new(),
+            tls: SmtpTls::Starttls,
+            from: String::new(),
+            to: Vec::new(),
+            username: String::new(),
+            password_file: PathBuf::new(),
+            ca_file: PathBuf::new(),
+            minimum_severity: Severity::High,
+            timeout: HumanDuration::from_secs(30),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Webhook {
+    /// HTTPS endpoint that receives a JSON POST.
+    pub url: String,
+    /// File holding a bearer token sent as `Authorization: Bearer`.
+    pub token_file: PathBuf,
+    /// CA certificates (PEM) to trust instead of the system store.
+    pub ca_file: PathBuf,
+    pub minimum_severity: Severity,
+    pub timeout: HumanDuration,
+}
+
+impl Default for Webhook {
+    fn default() -> Self {
+        Webhook {
+            url: String::new(),
+            token_file: PathBuf::new(),
+            ca_file: PathBuf::new(),
+            minimum_severity: Severity::High,
+            timeout: HumanDuration::from_secs(10),
+        }
+    }
+}
+
+/// Split `host` or `host:port` (IPv6 in brackets) for SMTP.
+pub fn split_host_port(s: &str, default_port: u16) -> Option<(String, u16)> {
+    let (host, port) = if let Some(rest) = s.strip_prefix('[') {
+        let (h, after) = rest.split_once(']')?;
+        match after.strip_prefix(':') {
+            Some(p) => (h, p.parse().ok()?),
+            None if after.is_empty() => (h, default_port),
+            None => return None,
+        }
+    } else {
+        match s.rsplit_once(':') {
+            Some((h, p)) => (h, p.parse().ok()?),
+            None => (s, default_port),
+        }
+    };
+    let valid = !host.is_empty()
+        && port != 0
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-._:".contains(&b));
+    valid.then(|| (host.to_owned(), port))
+}
+
+/// A plain email address, without display names or header-breaking bytes.
+pub fn valid_address(a: &str) -> bool {
+    let Some((local, domain)) = a.rsplit_once('@') else {
+        return false;
+    };
+    !local.is_empty()
+        && !domain.is_empty()
+        && (domain.contains('.') || domain == "localhost")
+        && a.bytes()
+            .all(|b| b.is_ascii_graphic() && !b"<>()[],;:\\\"".contains(&b))
 }
 
 /// How much of a command line is stored (NFR-011).
@@ -162,6 +279,8 @@ impl Default for Baseline {
 #[serde(deny_unknown_fields, default)]
 pub struct Alerts {
     pub minimum_severity: Severity,
+    /// Related alerts this close together are grouped into incidents.
+    pub correlation_window: HumanDuration,
     pub journal: bool,
     pub email: bool,
     pub webhook: bool,
@@ -177,6 +296,7 @@ impl Default for Config {
             paths: Paths::default(),
             execution: Execution::default(),
             baseline: Baseline::default(),
+            notifications: Notifications::default(),
             alerts: Alerts::default(),
         }
     }
@@ -188,6 +308,7 @@ impl Default for General {
             log_level: "info".into(),
             database: PathBuf::from(soteria_core::DEFAULT_DATABASE_PATH),
             event_retention_days: 90,
+            rules_directory: PathBuf::from("/etc/soteria/rules.d"),
         }
     }
 }
@@ -244,6 +365,7 @@ impl Default for Alerts {
     fn default() -> Self {
         Alerts {
             minimum_severity: Severity::Low,
+            correlation_window: HumanDuration::from_secs(3600),
             journal: true,
             email: false,
             webhook: false,
@@ -398,6 +520,7 @@ impl Config {
             );
         }
         v.absolute_path("general.database", &self.general.database);
+        v.absolute_path("general.rules_directory", &self.general.rules_directory);
         if self.general.database.as_os_str().is_empty() {
             v.error("general.database", "database path must not be empty");
         }
@@ -540,7 +663,87 @@ impl Config {
             );
         }
 
+        // [notifications]
+        let e = &self.notifications.email;
+        v.absolute_path("notifications.email.password_file", &e.password_file);
+        v.absolute_path("notifications.email.ca_file", &e.ca_file);
+        if self.alerts.email {
+            if split_host_port(&e.relay, 587).is_none() {
+                v.error(
+                    "notifications.email.relay",
+                    format!(
+                        "'{}' is not a valid relay; use host or host:port (alerts.email is on)",
+                        e.relay
+                    ),
+                );
+            }
+            if !valid_address(&e.from) {
+                v.error(
+                    "notifications.email.from",
+                    format!("'{}' is not a valid email address", e.from),
+                );
+            }
+            if e.to.is_empty() {
+                v.error(
+                    "notifications.email.to",
+                    "no recipients (alerts.email is on)",
+                );
+            }
+            for (i, to) in e.to.iter().enumerate() {
+                if !valid_address(to) {
+                    v.error(
+                        format!("notifications.email.to[{i}]"),
+                        format!("'{to}' is not a valid email address"),
+                    );
+                }
+            }
+            if e.username.is_empty() != e.password_file.as_os_str().is_empty() {
+                v.error(
+                    "notifications.email.password_file",
+                    "username and password_file must be set together",
+                );
+            }
+        }
+        let w = &self.notifications.webhook;
+        v.absolute_path("notifications.webhook.token_file", &w.token_file);
+        v.absolute_path("notifications.webhook.ca_file", &w.ca_file);
+        if self.alerts.webhook {
+            let ok = w
+                .url
+                .strip_prefix("https://")
+                .and_then(|rest| split_host_port(rest.split('/').next().unwrap_or(""), 443))
+                .is_some()
+                && !w
+                    .url
+                    .bytes()
+                    .any(|b| b.is_ascii_whitespace() || b.is_ascii_control());
+            if !ok {
+                v.error(
+                    "notifications.webhook.url",
+                    format!("'{}' is not a valid https:// URL (alerts.webhook is on; plain http is not allowed)", w.url),
+                );
+            }
+        }
+        for (field, d) in [
+            ("notifications.email.timeout", e.timeout),
+            ("notifications.webhook.timeout", w.timeout),
+        ] {
+            if d.0 < Duration::from_secs(1) || d.0 > Duration::from_secs(300) {
+                v.error(field, format!("{d} must be between 1 second and 5 minutes"));
+            }
+        }
+
         // [alerts]
+        let w = self.alerts.correlation_window.0;
+        if w < Duration::from_secs(60) || w > Duration::from_secs(7 * 24 * 3600) {
+            v.error(
+                "alerts.correlation_window",
+                format!(
+                    "{} must be between 1 minute and 7 days",
+                    self.alerts.correlation_window
+                ),
+            );
+        }
         if self.alerts.minimum_severity > Severity::Medium {
             v.warning(
                 "alerts.minimum_severity",
@@ -681,6 +884,7 @@ mod tests {
     #[test]
     fn bad_severity_is_a_parse_error() {
         assert!(parse("[alerts]\nminimum_severity = \"severe\"\n").is_err());
+        assert!(parse("[notifications.email]\ntls = \"none\"\n").is_err());
     }
 
     #[test]
@@ -797,5 +1001,49 @@ mod tests {
     fn effective_config_round_trips() {
         let cfg = Config::default();
         assert_eq!(parse(&cfg.to_toml()).unwrap(), cfg);
+    }
+
+    #[test]
+    fn notification_settings_are_checked_when_enabled() {
+        let errors = |text: &str| -> Vec<String> {
+            Config::from_toml_str(text, Path::new("t"))
+                .unwrap()
+                .validate(ValidateOptions {
+                    check_paths_exist: false,
+                })
+                .into_iter()
+                .filter(|i| i.level == IssueLevel::Error)
+                .map(|i| i.field)
+                .collect()
+        };
+        // Configured but switched off: not checked.
+        assert!(errors("[notifications.webhook]\nurl = \"http://x\"\n").is_empty());
+        let e = errors("[alerts]\nemail = true\nwebhook = true\n");
+        for f in [
+            "notifications.email.relay",
+            "notifications.email.from",
+            "notifications.email.to",
+            "notifications.webhook.url",
+        ] {
+            assert!(e.contains(&f.to_owned()), "{f}: {e:?}");
+        }
+        let good = "[notifications.email]\nrelay = \"mail.example.com:587\"\nfrom = \"soteria@host.example.com\"\n\
+                    to = [\"secops@example.com\"]\n[notifications.webhook]\nurl = \"https://hooks.example.com/x\"\n\
+                    [alerts]\nemail = true\nwebhook = true\n";
+        assert!(errors(good).is_empty(), "{:?}", errors(good));
+        let e = errors(
+            &good
+                .replace("https://hooks", "http://hooks")
+                .replace("secops@example.com", "a@b.c\\r\\nBcc: x@y.z"),
+        );
+        assert_eq!(
+            e,
+            ["notifications.email.to[0]", "notifications.webhook.url"]
+        );
+        let e = errors(&good.replace("relay = ", "username = \"u\"\nrelay = "));
+        assert_eq!(e, ["notifications.email.password_file"]);
+        assert_eq!(split_host_port("[::1]:25", 587), Some(("::1".into(), 25)));
+        assert_eq!(split_host_port("mail", 587), Some(("mail".into(), 587)));
+        assert_eq!(split_host_port("mail:x", 587), None);
     }
 }

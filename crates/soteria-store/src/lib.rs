@@ -178,6 +178,13 @@ impl Store {
         })
     }
 
+    /// How long a write waits for the database lock. Administrative
+    /// commands wait longer, since a scan in the daemon may hold the lock.
+    pub fn set_busy_timeout(&self, timeout: Duration) -> Result<()> {
+        self.conn.busy_timeout(timeout)?;
+        Ok(())
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }

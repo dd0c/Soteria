@@ -42,6 +42,10 @@ impl Env {
         let mut text = soteria_default_config()
             .replace("/var/lib/soteria/soteria.db", self.db().to_str().unwrap())
             .replace(
+                "/etc/soteria/rules.d",
+                self.dir.path().join("rules.d").to_str().unwrap(),
+            )
+            .replace(
                 "/etc/soteria/keys",
                 self.dir.path().join("keys").to_str().unwrap(),
             );
@@ -327,18 +331,10 @@ fn verify_before_init_exits_5() {
 #[test]
 fn unavailable_commands_exit_7_with_json_error() {
     let env = Env::new();
-    for args in [
-        vec!["scan", "--kernel"],
-        vec!["alerts", "ack", "1"],
-        vec!["alerts", "export"],
-        vec!["rules", "list"],
-        vec!["report", "summary"],
-    ] {
-        let (code, v) = env.json(&args);
-        assert_eq!(code, 7, "{args:?}");
-        assert_eq!(v["kind"], "unavailable");
-        assert!(v["message"].as_str().unwrap().contains("milestone"));
-    }
+    let (code, v) = env.json(&["scan", "--kernel"]);
+    assert_eq!(code, 7);
+    assert_eq!(v["kind"], "unavailable");
+    assert!(v["message"].as_str().unwrap().contains("milestone"));
 }
 
 #[test]
@@ -465,6 +461,269 @@ fn events_and_alerts_queries() {
         let (code, v) = env.json(&bad);
         assert_eq!(code, 2, "{bad:?}: {v}");
     }
+}
+
+/// Insert an alert directly, as the daemon would.
+fn insert_alert(env: &Env, object: &str) -> i64 {
+    let c = rusqlite::Connection::open(env.db()).unwrap();
+    c.execute(
+        "INSERT INTO alerts (uuid, created_at, updated_at, severity, type, status, hostname, object, rule_id,
+                             reason, evidence, recommendation)
+         VALUES (?1, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z', 'high', 'execution', 'open', 'h',
+                 ?2, 'EXE-001', '=cmd|calc', '{\"pid\":1}', 'look')",
+        rusqlite::params![format!("u-{object}"), object],
+    )
+    .unwrap();
+    c.last_insert_rowid()
+}
+
+#[test]
+fn alert_lifecycle_suppression_and_export() {
+    let env = Env::new();
+    env.init();
+    let id = insert_alert(&env, "/tmp/x").to_string();
+    let other = insert_alert(&env, "/tmp/y").to_string();
+
+    let (code, v) = env.json(&["alerts", "ack", &id, "--note", "looking"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["from"], "open");
+    let (code, _) = env.json(&["alerts", "ack", &id]);
+    assert_eq!(code, 2, "acknowledging twice is a usage error");
+    let (code, v) = env.json(&["alerts", "note", &id, "backup job"]);
+    assert_eq!(code, 0, "{v}");
+    let (code, v) = env.json(&["alerts", "show", &id]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["status"], "acknowledged");
+    let history = v["history"].as_array().unwrap();
+    assert_eq!(history.len(), 2, "{v}");
+    assert_eq!(history[1]["note"], "backup job");
+
+    let (code, v) = env.json(&["alerts", "suppress", &id, "--reason", "build server"]);
+    assert_eq!(code, 0, "{v}");
+    let sid = v["suppression"].as_i64().unwrap().to_string();
+    let (code, v) = env.json(&["alerts", "suppressions"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v.as_array().unwrap().len(), 1, "{v}");
+    let (code, v) = env.json(&["alerts", "list", "--status", "suppressed"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["total_matching"], 1);
+    let (code, _) = env.json(&["alerts", "unsuppress", &sid]);
+    assert_eq!(code, 0);
+    let (code, _) = env.json(&["alerts", "unsuppress", &sid]);
+    assert_eq!(code, 2);
+
+    let (code, v) = env.json(&["alerts", "close", &other]);
+    assert_eq!(code, 0, "{v}");
+    let (code, v) = env.json(&["alerts", "list", "--object", "/tmp/y", "--rule", "exe-001"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["total_matching"], 1);
+    assert_eq!(v["alerts"][0]["status"], "closed");
+
+    let csv = env.dir.path().join("alerts.csv");
+    env.cmd()
+        .args(["alerts", "export", "--format", "csv", "--output"])
+        .arg(&csv)
+        .assert()
+        .success();
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::metadata(&csv).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let text = std::fs::read_to_string(&csv).unwrap();
+    assert_eq!(text.lines().count(), 3, "{text}");
+    assert!(text.contains("'=cmd|calc"), "formula guard: {text}");
+    let out = env.cmd().args(["alerts", "export"]).output().unwrap();
+    let all: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(all.as_array().unwrap().len(), 2);
+    let out = env
+        .cmd()
+        .args(["alerts", "export", "--format", "text", "--status", "closed"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&out.stdout).contains("/tmp/y"));
+
+    for bad in [
+        vec!["alerts", "ack", "999"],
+        vec!["alerts", "note", &id, "  "],
+        vec![
+            "alerts",
+            "suppress",
+            &id,
+            "--reason",
+            "x",
+            "--expires",
+            "soonish",
+        ],
+    ] {
+        let (code, v) = env.json(&bad);
+        assert_eq!(code, 2, "{bad:?}: {v}");
+    }
+}
+
+#[test]
+fn incidents_are_listed_and_close_with_their_alerts() {
+    let env = Env::new();
+    env.init();
+    let a = insert_alert(&env, "/usr/local/bin/x");
+    let b = insert_alert(&env, "/tmp/other");
+    {
+        let c = rusqlite::Connection::open(env.db()).unwrap();
+        c.execute(
+            "INSERT INTO incidents (created_at, updated_at, severity, title, status)
+             VALUES ('2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z', 'high', 'Changed program executed', 'open')",
+            [],
+        )
+        .unwrap();
+        let i = c.last_insert_rowid();
+        c.execute(
+            "UPDATE alerts SET incident_id = ?1 WHERE id IN (?2, ?3)",
+            rusqlite::params![i, a, b],
+        )
+        .unwrap();
+    }
+    let (code, v) = env.json(&["alerts", "incidents"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v[0]["alerts"], 2);
+    let (code, v) = env.json(&["alerts", "incident", "1"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["alerts"].as_array().unwrap().len(), 2);
+    let (_, v) = env.json(&["alerts", "list", "--incident", "1"]);
+    assert_eq!(v["total_matching"], 2);
+    assert_eq!(env.json(&["alerts", "incident", "9"]).0, 2);
+
+    env.json(&["alerts", "close", &a.to_string()]);
+    let (_, v) = env.json(&["alerts", "incidents"]);
+    assert_eq!(v.as_array().unwrap().len(), 1, "one alert still open");
+    env.json(&["alerts", "close", &b.to_string()]);
+    let (_, v) = env.json(&["alerts", "incidents"]);
+    assert_eq!(v.as_array().unwrap().len(), 0, "{v}");
+    let (_, v) = env.json(&["alerts", "incidents", "--all"]);
+    assert_eq!(v[0]["status"], "closed");
+}
+
+#[test]
+fn test_notifications_reports_each_channel() {
+    let env = Env::new();
+    env.cmd()
+        .args(["config", "test-notifications"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "No notification channel is enabled",
+        ));
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let text = std::fs::read_to_string(&env.config)
+        .unwrap()
+        .replace(
+            "url = \"\"",
+            &format!("url = \"https://localhost:{port}/x\""),
+        )
+        .replace("webhook = false", "webhook = true");
+    std::fs::write(&env.config, text).unwrap();
+    let (code, v) = env.json(&["config", "test-notifications"]);
+    assert_eq!(code, 1, "{v}");
+    assert_eq!(v["channels"][0]["channel"], "webhook");
+    assert_eq!(v["channels"][0]["delivered"], false);
+}
+
+#[test]
+fn reports_cover_scans_and_a_summary() {
+    let env = Env::new();
+    std::fs::create_dir_all(env.root()).unwrap();
+    std::fs::write(env.root().join("a"), "x").unwrap();
+    env.init();
+    env.cmd()
+        .args(["scan"])
+        .assert()
+        .code(predicate::in_iter([0, 1]));
+    let (code, v) = env.json(&["report", "scans"]);
+    assert_eq!(code, 0, "{v}");
+    let scans = v.as_array().unwrap();
+    assert!(!scans.is_empty(), "{v}");
+    let (code, v) = env.json(&["report", "scan", "latest"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["scan"]["id"], scans[0]["id"]);
+    assert!(v["scan"]["checked"].as_i64().unwrap() >= 1, "{v}");
+    let uuid = v["scan"]["uuid"].as_str().unwrap().to_owned();
+    env.cmd()
+        .args(["report", "scan", &uuid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Result:"));
+    assert_eq!(env.json(&["report", "scan", "nope"]).0, 2);
+
+    insert_alert(&env, "/tmp/x");
+    let (code, v) = env.json(&["report", "summary", "--since", "100000d"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["alerts_raised"]["high"], 1, "{v}");
+    assert_eq!(v["top_rules"][0][0], "EXE-001");
+    env.cmd()
+        .args(["report", "summary"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("SOTERIA SECURITY SUMMARY"));
+}
+
+#[test]
+fn rules_list_show_and_validate() {
+    let env = Env::new();
+    env.init();
+    let (code, v) = env.json(&["rules", "list"]);
+    assert_eq!(code, 0, "{v}");
+    let ids: Vec<&str> = v["rules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_str().unwrap())
+        .collect();
+    assert!(
+        ids.contains(&"FIM-003") && ids.contains(&"EXE-004") && ids.contains(&"INT-001"),
+        "{ids:?}"
+    );
+    env.cmd()
+        .args(["rules", "show", "exe-001"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("unusual location"));
+    let (code, _) = env.json(&["rules", "show", "NOPE-1"]);
+    assert_eq!(code, 2);
+
+    let dir = env.dir.path().join("rules.d");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("site.toml"),
+        "[[override]]\nrule = \"FIM-011\"\nenabled = false\n\n\
+         [[rule]]\nid = \"SITE-1\"\ntitle = \"Sudoers changed\"\non = \"file\"\nseverity = \"critical\"\n\
+         paths = [\"/etc/sudoers\", \"/etc/sudoers.d/*\"]\n",
+    )
+    .unwrap();
+    let (code, v) = env.json(&["rules", "validate"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["admin_rules"], 1);
+    assert_eq!(v["overrides"], 1);
+    let (_, v) = env.json(&["rules", "show", "SITE-1"]);
+    assert_eq!(v["severity"], "critical");
+    assert_eq!(v["matcher"]["on"], "file");
+    let (_, v) = env.json(&["rules", "show", "FIM-011"]);
+    assert_eq!(v["enabled"], false);
+
+    std::fs::write(dir.join("zz-bad.toml"), "[[rule]]\nid = \"SITE-1\"\n").unwrap();
+    let (code, v) = env.json(&["rules", "validate"]);
+    assert_eq!(code, 3, "{v}");
+    let (code, v) = env.json(&["config", "validate"]);
+    assert_eq!(code, 3, "{v}");
+    assert!(
+        v["issues"][0]["field"]
+            .as_str()
+            .unwrap()
+            .contains("zz-bad.toml"),
+        "{v}"
+    );
 }
 
 #[test]
