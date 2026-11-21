@@ -15,7 +15,9 @@ use serde::Serialize;
 use soteria_inventory::{FileRecord, Gap, GapKind, Scanner, Scope, Visitor, WalkStats};
 use soteria_store::{Store, new_id, now};
 
-use crate::compare::diff_record;
+use soteria_core::FileKind;
+
+use crate::compare::{ChangeKind, diff_record};
 use crate::rows::{self, COLUMNS, path_bytes, path_from_bytes};
 
 /// Sensor name used for gaps found by scans.
@@ -107,6 +109,10 @@ pub enum ScanError {
 struct Writer<'t> {
     tx: &'t Transaction<'t>,
     started: String,
+    scan_id: String,
+    /// Record each inventory change as an event. Off for the first scan of
+    /// an empty inventory, where every object would be "created".
+    record_events: bool,
     changes: InventoryChanges,
     gaps: Vec<Gap>,
     error: Option<rusqlite::Error>,
@@ -114,38 +120,109 @@ struct Writer<'t> {
 
 impl Writer<'_> {
     fn upsert(&mut self, r: &FileRecord) -> rusqlite::Result<()> {
-        let existing = self
-            .tx
-            .prepare_cached(&format!("SELECT {COLUMNS} FROM files WHERE path = ?1"))?
-            .query_row([path_bytes(&r.path)], |row| rows::from_row(row, 0))
-            .map(Some)
-            .or_else(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => Ok(None),
-                e => Err(e),
-            })?;
-        match &existing {
-            None => self.changes.added += 1,
-            Some(old) if !diff_record(old, r).is_empty() => self.changes.changed += 1,
-            Some(_) => {}
+        match load_file(self.tx, &r.path)? {
+            None => {
+                self.changes.added += 1;
+                self.event(
+                    "file.created",
+                    &r.path,
+                    &[ChangeKind::New],
+                    r.sha256.as_deref(),
+                )?;
+            }
+            Some(old) => {
+                let kinds = diff_record(&old, r);
+                if !kinds.is_empty() {
+                    self.changes.changed += 1;
+                    // Directory timestamps change with every entry; not news.
+                    let churn =
+                        kinds == [ChangeKind::MetadataModified] && r.kind == FileKind::Directory;
+                    if !churn {
+                        self.event("file.modified", &r.path, &kinds, r.sha256.as_deref())?;
+                    }
+                }
+            }
         }
-        let mut values: Vec<rusqlite::types::Value> = rows::params(r).into();
-        values.push(self.started.clone().into());
-        values.push(r.error.clone().into());
-        self.tx
-            .prepare_cached(&format!(
-                "INSERT INTO files ({COLUMNS}, first_seen, last_verified, last_error)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?16, ?17)
-                 ON CONFLICT(path) DO UPDATE SET
-                   kind = excluded.kind, file_type = excluded.file_type, sha256 = excluded.sha256,
-                   size = excluded.size, uid = excluded.uid, gid = excluded.gid, mode = excluded.mode,
-                   mtime_ns = excluded.mtime_ns, ctime_ns = excluded.ctime_ns, inode = excluded.inode,
-                   device = excluded.device, symlink_target = excluded.symlink_target,
-                   capabilities = excluded.capabilities, security_label = excluded.security_label,
-                   last_verified = excluded.last_verified, last_error = excluded.last_error"
-            ))?
-            .execute(rusqlite::params_from_iter(values))?;
+        upsert_file(self.tx, r, &self.started)
+    }
+
+    fn event(
+        &self,
+        event_type: &str,
+        path: &Path,
+        kinds: &[ChangeKind],
+        sha256: Option<&str>,
+    ) -> rusqlite::Result<()> {
+        if self.record_events {
+            record_scan_event(self.tx, &self.scan_id, event_type, path, kinds, sha256)?;
+        }
         Ok(())
     }
+}
+
+/// Record an inventory change found by a scan as an event (sensor
+/// "scanner"), so changes that no live event reported still appear in the
+/// event history (FR-016).
+fn record_scan_event(
+    conn: &rusqlite::Connection,
+    scan_id: &str,
+    event_type: &str,
+    path: &Path,
+    kinds: &[ChangeKind],
+    sha256: Option<&str>,
+) -> rusqlite::Result<()> {
+    let kinds: Vec<&str> = kinds.iter().map(|k| k.as_str()).collect();
+    conn.prepare_cached(
+        "INSERT INTO events (ts, sensor, type, severity, path, data) VALUES (?1, ?2, ?3, 'info', ?4, ?5)",
+    )?
+    .execute(params![
+        now(),
+        SCANNER,
+        event_type,
+        path_bytes(path),
+        serde_json::json!({ "changes": kinds, "sha256": sha256, "scan": scan_id }).to_string()
+    ])?;
+    Ok(())
+}
+
+/// Current inventory record for one path.
+pub fn load_file(conn: &rusqlite::Connection, path: &Path) -> rusqlite::Result<Option<FileRecord>> {
+    conn.prepare_cached(&format!("SELECT {COLUMNS} FROM files WHERE path = ?1"))?
+        .query_row([path_bytes(path)], |row| rows::from_row(row, 0))
+        .map(Some)
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            e => Err(e),
+        })
+}
+
+/// Insert or refresh one inventory record, keeping its first-seen time.
+pub fn upsert_file(
+    conn: &rusqlite::Connection,
+    r: &FileRecord,
+    verified_at: &str,
+) -> rusqlite::Result<()> {
+    let mut values: Vec<rusqlite::types::Value> = rows::params(r).into();
+    values.push(verified_at.to_owned().into());
+    values.push(r.error.clone().into());
+    conn.prepare_cached(&format!(
+        "INSERT INTO files ({COLUMNS}, first_seen, last_verified, last_error)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?16, ?17)
+         ON CONFLICT(path) DO UPDATE SET
+           kind = excluded.kind, file_type = excluded.file_type, sha256 = excluded.sha256,
+           size = excluded.size, uid = excluded.uid, gid = excluded.gid, mode = excluded.mode,
+           mtime_ns = excluded.mtime_ns, ctime_ns = excluded.ctime_ns, inode = excluded.inode,
+           device = excluded.device, symlink_target = excluded.symlink_target,
+           capabilities = excluded.capabilities, security_label = excluded.security_label,
+           last_verified = excluded.last_verified, last_error = excluded.last_error"
+    ))?
+    .execute(rusqlite::params_from_iter(values))?;
+    Ok(())
+}
+
+/// Remove one path from the inventory. Returns whether it was present.
+pub fn delete_file(conn: &rusqlite::Connection, path: &Path) -> rusqlite::Result<bool> {
+    Ok(conn.execute("DELETE FROM files WHERE path = ?1", [path_bytes(path)])? > 0)
 }
 
 impl Visitor for Writer<'_> {
@@ -178,7 +255,7 @@ pub fn run(
         params![id, scan_type, target.label(), started],
     )?;
 
-    let result = scan_in_transaction(store, scope, target, &started);
+    let result = scan_in_transaction(store, scope, target, &started, &id);
     let (stats, changes, gaps) = match result {
         Ok(v) => v,
         Err(e) => {
@@ -256,11 +333,16 @@ fn scan_in_transaction(
     scope: &Scope,
     target: &ScanTarget,
     started: &str,
+    scan_id: &str,
 ) -> rusqlite::Result<ScanOutput> {
     let tx = store.connection_mut().transaction()?;
+    let inventory_empty: bool =
+        tx.query_row("SELECT NOT EXISTS (SELECT 1 FROM files)", [], |r| r.get(0))?;
     let mut writer = Writer {
         tx: &tx,
         started: started.to_owned(),
+        scan_id: scan_id.to_owned(),
+        record_events: !inventory_empty,
         changes: InventoryChanges::default(),
         gaps: Vec::new(),
         error: None,
@@ -292,6 +374,14 @@ fn scan_in_transaction(
         if target.covers(&path) && !blind.iter().any(|b| path.starts_with(b)) {
             tx.execute("DELETE FROM files WHERE id = ?1", [rowid])?;
             changes.removed += 1;
+            record_scan_event(
+                &tx,
+                scan_id,
+                "file.deleted",
+                &path,
+                &[ChangeKind::Missing],
+                None,
+            )?;
         }
     }
 

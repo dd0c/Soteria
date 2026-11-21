@@ -137,26 +137,54 @@ pub fn run(args: &VerifyArgs, global: &GlobalArgs, out: &Output) -> CmdResult {
             }
             Err(e) => checks.add("platform", "os", CheckState::Warn, e.to_string()),
         }
-        if wanted(Component::Sensors) {
-            checks.add(
-                "sensors",
-                "event_sensors",
-                CheckState::Skipped,
-                "filesystem and execution sensors arrive with milestones 3 and 4",
-            );
-        }
     }
 
     let store = match &config {
         Some(cfg)
             if wanted(Component::Database)
                 || wanted(Component::Baseline)
+                || wanted(Component::Sensors)
                 || wanted(Component::Service) =>
         {
             verify_database(cfg, wanted(Component::Database), &mut checks)
         }
         _ => None,
     };
+
+    // Event sensors as last reported by the agent.
+    if wanted(Component::Sensors)
+        && let Some(s) = &store
+    {
+        let sensors: Vec<_> = s
+            .sensor_states()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| s.sensor != "agent" && s.sensor != "baseline")
+            .collect();
+        if sensors.is_empty() {
+            checks.add(
+                "sensors",
+                "event_sensors",
+                CheckState::Warn,
+                "no sensor has reported yet; the monitoring service has not run",
+            );
+        }
+        for sensor in sensors {
+            let detail = format!(
+                "{} since {}{}",
+                sensor.state,
+                sensor.since,
+                sensor.detail.map(|d| format!(": {d}")).unwrap_or_default()
+            );
+            let name = format!("{}_sensor", sensor.sensor);
+            match sensor.state.as_str() {
+                "running" => checks.add("sensors", name, CheckState::Pass, detail),
+                "disabled" => checks.add("sensors", name, CheckState::Skipped, detail),
+                "failed" => checks.fail("sensors", name, detail, ExitStatus::Unavailable),
+                _ => checks.add("sensors", name, CheckState::Warn, detail),
+            }
+        }
+    }
 
     if wanted(Component::Baseline) {
         match (&store, &config) {

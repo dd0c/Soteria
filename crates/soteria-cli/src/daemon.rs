@@ -1,22 +1,23 @@
 //! `soteria daemon`: the long-running agent started by `soteria.service`.
 //!
-//! Milestone 1 provides the service lifecycle only: strict configuration
-//! validation before start, database checks, recording of start/stop and
-//! interrupted scans, a heartbeat for `status`, and systemd readiness and
-//! watchdog notifications. Sensors and scanning attach to this loop in later
-//! milestones.
+//! The daemon owns the service lifecycle: strict configuration validation
+//! before start, database checks, recording of start/stop and interrupted
+//! scans, a heartbeat for `status`, and systemd readiness and watchdog
+//! notifications. Monitoring itself is done by [`soteria_agent::Agent`],
+//! which this loop drives.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use soteria_agent::{Agent, Options};
 use soteria_core::ExitStatus;
 use soteria_store::Store;
 use tracing::{error, info, warn};
 
 use crate::cli::GlobalArgs;
-use crate::context::{BaselineCheck, check_latest_baseline, load_config, store_failure};
-use crate::health::{HEARTBEAT_INTERVAL_SECS, HEARTBEAT_KEY};
+use crate::context::{load_config, store_failure};
+use crate::health::{HEARTBEAT_INTERVAL_SECS, HEARTBEAT_KEY, STALL_LIMIT_SECS};
 use crate::output::{CmdResult, Failure};
 use crate::sdnotify;
 
@@ -57,31 +58,6 @@ pub fn run(global: &GlobalArgs) -> CmdResult {
         );
     }
 
-    // Baseline integrity verification at service startup (FR-032). A failed
-    // seal does not stop the agent, which must keep reporting, but it is
-    // recorded and logged loudly.
-    match check_latest_baseline(&store, &config) {
-        Ok(BaselineCheck::None) => {
-            warn!("no approved baseline; run 'sudo soteria init' to establish one");
-            record_sensor(&store, "baseline", "none", None);
-        }
-        Ok(BaselineCheck::Verified { version }) => {
-            info!(version, "approved baseline verified");
-            record_sensor(&store, "baseline", "verified", Some(&format!("v{version}")));
-        }
-        Ok(BaselineCheck::Failed { version, problems }) => {
-            let detail = format!("v{version}: {}", problems.join("; "));
-            error!("baseline verification FAILED: {detail}");
-            record_sensor(&store, "baseline", "failed", Some(&detail));
-        }
-        Ok(BaselineCheck::Unverifiable { version, reason }) => {
-            let detail = format!("v{version}: {reason}");
-            error!("baseline cannot be verified: {detail}");
-            record_sensor(&store, "baseline", "unverifiable", Some(&detail));
-        }
-        Err(f) => error!("baseline verification error: {}", f.message),
-    }
-
     let stop = Arc::new(AtomicBool::new(false));
     for sig in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
         signal_hook::flag::register(sig, Arc::clone(&stop)).map_err(|e| {
@@ -92,34 +68,107 @@ pub fn run(global: &GlobalArgs) -> CmdResult {
         })?;
     }
 
+    // Starting the agent verifies the approved baseline's seal (FR-032):
+    // a failed seal raises a critical alert but does not stop the agent,
+    // which must keep reporting.
+    let mut agent = Agent::start(config, store, Options::default())
+        .map_err(|e| Failure::new(ExitStatus::Internal, format!("cannot start agent: {e}")))?;
+
     record(
-        &store,
+        agent.store(),
         "running",
         Some(&format!("version {}", soteria_core::VERSION)),
     );
-    heartbeat(&store);
+    heartbeat(agent.store());
+    agent.write_health();
     sdnotify::notify("READY=1\nSTATUS=Monitoring service running");
-    info!(version = soteria_core::VERSION, database = %config.general.database.display(), "soteria agent started");
+    info!(version = soteria_core::VERSION, "soteria agent started");
 
-    let watchdog = sdnotify::watchdog_interval();
+    // A full scan holds the database for its whole duration, so the systemd
+    // watchdog is fed from a separate thread for as long as the main loop
+    // keeps making progress. A loop stuck for longer than the stall limit
+    // stops feeding it and systemd restarts the service.
+    let epoch = Instant::now();
+    let progress = Arc::new(AtomicU64::new(0));
+    let watchdog = sdnotify::watchdog_interval().map(|w| {
+        let (stop, progress) = (Arc::clone(&stop), Arc::clone(&progress));
+        std::thread::Builder::new()
+            .name("watchdog".into())
+            .spawn(move || feed_watchdog(w / 2, epoch, &progress, &stop))
+    });
+
     let beat = Duration::from_secs(HEARTBEAT_INTERVAL_SECS);
-    let tick = watchdog.map(|w| (w / 2).min(beat)).unwrap_or(beat);
     let mut last = Instant::now();
+    let mut last_health = Instant::now();
+    let mut failures = 0u32;
     while !stop.load(Ordering::Relaxed) {
-        std::thread::sleep(Duration::from_millis(250));
-        if last.elapsed() >= tick {
-            heartbeat(&store);
-            if watchdog.is_some() {
-                sdnotify::notify("WATCHDOG=1");
+        match agent.step(Duration::from_millis(250)) {
+            Ok(()) => failures = 0,
+            Err(e) => {
+                failures += 1;
+                error!("monitoring step failed: {e}");
+                if failures >= MAX_CONSECUTIVE_FAILURES {
+                    let msg = format!("giving up after {failures} consecutive failures: {e}");
+                    record(agent.store(), "failed", Some(&msg));
+                    stop.store(true, Ordering::Relaxed);
+                    agent.shutdown();
+                    return Err(Failure::new(ExitStatus::Internal, msg));
+                }
+                std::thread::sleep(Duration::from_secs(1));
             }
+        }
+        progress.store(epoch.elapsed().as_secs(), Ordering::Relaxed);
+        if last.elapsed() >= beat {
+            heartbeat(agent.store());
             last = Instant::now();
+        }
+        if last_health.elapsed() >= HEALTH_INTERVAL {
+            agent.write_health();
+            last_health = Instant::now();
         }
     }
 
     sdnotify::notify("STOPPING=1");
-    record(&store, "stopped", Some("clean shutdown"));
+    if let Some(Ok(h)) = watchdog {
+        let _ = h.join();
+    }
+    agent.write_health();
+    record(agent.store(), "stopped", Some("clean shutdown"));
+    agent.shutdown();
     info!("soteria agent stopped");
     Ok(ExitStatus::Ok)
+}
+
+/// How often the agent's health snapshot is refreshed for `status`.
+const HEALTH_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Consecutive failed steps (for example a database that stays locked)
+/// before the daemon exits and lets systemd restart it.
+const MAX_CONSECUTIVE_FAILURES: u32 = 30;
+
+fn feed_watchdog(tick: Duration, epoch: Instant, progress: &AtomicU64, stop: &AtomicBool) {
+    let mut warned = false;
+    while !stop.load(Ordering::Relaxed) {
+        let idle = epoch
+            .elapsed()
+            .as_secs()
+            .saturating_sub(progress.load(Ordering::Relaxed));
+        if idle <= STALL_LIMIT_SECS as u64 {
+            sdnotify::notify("WATCHDOG=1");
+            warned = false;
+        } else if !warned {
+            error!(
+                idle_secs = idle,
+                "monitoring loop is stalled; no longer feeding the watchdog"
+            );
+            warned = true;
+        }
+        // Sleep in short slices so shutdown is prompt.
+        let until = Instant::now() + tick;
+        while Instant::now() < until && !stop.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
 }
 
 fn record(store: &Store, state: &str, detail: Option<&str>) {
