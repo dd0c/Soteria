@@ -200,7 +200,8 @@ pub fn valid_address(a: &str) -> bool {
     !local.is_empty()
         && !domain.is_empty()
         && (domain.contains('.') || domain == "localhost")
-        && a.bytes().all(|b| b.is_ascii_graphic() && !b"<>()[],;:\\\"".contains(&b))
+        && a.bytes()
+            .all(|b| b.is_ascii_graphic() && !b"<>()[],;:\\\"".contains(&b))
 }
 
 /// How much of a command line is stored (NFR-011).
@@ -670,18 +671,30 @@ impl Config {
             if split_host_port(&e.relay, 587).is_none() {
                 v.error(
                     "notifications.email.relay",
-                    format!("'{}' is not a valid relay; use host or host:port (alerts.email is on)", e.relay),
+                    format!(
+                        "'{}' is not a valid relay; use host or host:port (alerts.email is on)",
+                        e.relay
+                    ),
                 );
             }
             if !valid_address(&e.from) {
-                v.error("notifications.email.from", format!("'{}' is not a valid email address", e.from));
+                v.error(
+                    "notifications.email.from",
+                    format!("'{}' is not a valid email address", e.from),
+                );
             }
             if e.to.is_empty() {
-                v.error("notifications.email.to", "no recipients (alerts.email is on)");
+                v.error(
+                    "notifications.email.to",
+                    "no recipients (alerts.email is on)",
+                );
             }
             for (i, to) in e.to.iter().enumerate() {
                 if !valid_address(to) {
-                    v.error(format!("notifications.email.to[{i}]"), format!("'{to}' is not a valid email address"));
+                    v.error(
+                        format!("notifications.email.to[{i}]"),
+                        format!("'{to}' is not a valid email address"),
+                    );
                 }
             }
             if e.username.is_empty() != e.password_file.as_os_str().is_empty() {
@@ -700,7 +713,10 @@ impl Config {
                 .strip_prefix("https://")
                 .and_then(|rest| split_host_port(rest.split('/').next().unwrap_or(""), 443))
                 .is_some()
-                && !w.url.bytes().any(|b| b.is_ascii_whitespace() || b.is_ascii_control());
+                && !w
+                    .url
+                    .bytes()
+                    .any(|b| b.is_ascii_whitespace() || b.is_ascii_control());
             if !ok {
                 v.error(
                     "notifications.webhook.url",
@@ -992,7 +1008,9 @@ mod tests {
         let errors = |text: &str| -> Vec<String> {
             Config::from_toml_str(text, Path::new("t"))
                 .unwrap()
-                .validate(ValidateOptions { check_paths_exist: false })
+                .validate(ValidateOptions {
+                    check_paths_exist: false,
+                })
                 .into_iter()
                 .filter(|i| i.level == IssueLevel::Error)
                 .map(|i| i.field)
@@ -1001,15 +1019,27 @@ mod tests {
         // Configured but switched off: not checked.
         assert!(errors("[notifications.webhook]\nurl = \"http://x\"\n").is_empty());
         let e = errors("[alerts]\nemail = true\nwebhook = true\n");
-        for f in ["notifications.email.relay", "notifications.email.from", "notifications.email.to", "notifications.webhook.url"] {
+        for f in [
+            "notifications.email.relay",
+            "notifications.email.from",
+            "notifications.email.to",
+            "notifications.webhook.url",
+        ] {
             assert!(e.contains(&f.to_owned()), "{f}: {e:?}");
         }
         let good = "[notifications.email]\nrelay = \"mail.example.com:587\"\nfrom = \"soteria@host.example.com\"\n\
                     to = [\"secops@example.com\"]\n[notifications.webhook]\nurl = \"https://hooks.example.com/x\"\n\
                     [alerts]\nemail = true\nwebhook = true\n";
         assert!(errors(good).is_empty(), "{:?}", errors(good));
-        let e = errors(&good.replace("https://hooks", "http://hooks").replace("secops@example.com", "a@b.c\\r\\nBcc: x@y.z"));
-        assert_eq!(e, ["notifications.email.to[0]", "notifications.webhook.url"]);
+        let e = errors(
+            &good
+                .replace("https://hooks", "http://hooks")
+                .replace("secops@example.com", "a@b.c\\r\\nBcc: x@y.z"),
+        );
+        assert_eq!(
+            e,
+            ["notifications.email.to[0]", "notifications.webhook.url"]
+        );
         let e = errors(&good.replace("relay = ", "username = \"u\"\nrelay = "));
         assert_eq!(e, ["notifications.email.password_file"]);
         assert_eq!(split_host_port("[::1]:25", 587), Some(("::1".into(), 25)));

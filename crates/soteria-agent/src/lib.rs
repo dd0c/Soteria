@@ -11,6 +11,7 @@ pub mod exec;
 mod exec_sensor;
 pub mod incidents;
 pub mod lifecycle;
+mod notify;
 pub mod retention;
 pub mod rules;
 
@@ -159,6 +160,8 @@ pub struct Agent {
     rules: Arc<RuleSet>,
     /// When old events and execution records are next deleted.
     next_retention: Instant,
+    /// Email and webhook delivery, when enabled.
+    notifier: Option<notify::Notifier>,
 }
 
 impl Agent {
@@ -179,6 +182,7 @@ impl Agent {
             rules,
             // Not at once: the startup scan comes first.
             next_retention: now_i + RETENTION_FIRST,
+            notifier: notify::Notifier::start(&config, &soteria_platform::hostname(), &store)?,
             next_full: if startup_scan {
                 now_i
             } else {
@@ -398,6 +402,9 @@ impl Agent {
             self.store.connection(),
             self.config.alerts.correlation_window.0,
         )?;
+        if let Some(n) = self.notifier.as_mut() {
+            n.step(&self.store)?;
+        }
         if Instant::now() >= self.next_retention {
             self.prune()?;
         }
@@ -862,6 +869,9 @@ impl Agent {
     /// Stop the sensor thread and record the shutdown.
     pub fn shutdown(mut self) {
         self.sensor_stop.store(true, Ordering::Relaxed);
+        if let Some(n) = self.notifier.as_mut() {
+            n.shutdown();
+        }
         if let Some(h) = self.sensor.take() {
             let _ = h.join();
         }

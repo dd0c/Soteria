@@ -53,8 +53,10 @@ ProtectControlGroups=yes
 ProtectProc=default
 PrivateDevices=yes
 PrivateNetwork=no
-# AF_INET/AF_INET6 are added when webhook/email notifications land (M5).
-RestrictAddressFamilies=AF_UNIX AF_NETLINK
+# AF_INET/AF_INET6 carry email (SMTP relay) and webhook notifications,
+# which are off unless enabled in [alerts]. Sites that never use them can
+# drop both in a drop-in: RestrictAddressFamilies=AF_UNIX AF_NETLINK
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
 RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes

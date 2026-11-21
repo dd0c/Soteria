@@ -605,6 +605,35 @@ fn incidents_are_listed_and_close_with_their_alerts() {
 }
 
 #[test]
+fn test_notifications_reports_each_channel() {
+    let env = Env::new();
+    env.cmd()
+        .args(["config", "test-notifications"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "No notification channel is enabled",
+        ));
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let text = std::fs::read_to_string(&env.config)
+        .unwrap()
+        .replace(
+            "url = \"\"",
+            &format!("url = \"https://localhost:{port}/x\""),
+        )
+        .replace("webhook = false", "webhook = true");
+    std::fs::write(&env.config, text).unwrap();
+    let (code, v) = env.json(&["config", "test-notifications"]);
+    assert_eq!(code, 1, "{v}");
+    assert_eq!(v["channels"][0]["channel"], "webhook");
+    assert_eq!(v["channels"][0]["delivered"], false);
+}
+
+#[test]
 fn rules_list_show_and_validate() {
     let env = Env::new();
     env.init();

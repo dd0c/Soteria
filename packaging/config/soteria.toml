@@ -66,6 +66,34 @@ recent_change = "1h"
 signing_key = "/etc/soteria/keys/baseline.key"
 public_key = "/etc/soteria/keys/baseline.pub"
 
+# Email and webhook notifications (switched on by alerts.email and
+# alerts.webhook below). Core monitoring never depends on them: delivery
+# runs separately, failures are retried and reported by 'soteria status'.
+[notifications.email]
+# SMTP relay as host or host:port. Mail is always encrypted: "starttls"
+# (port 587 by default) or "implicit" TLS (port 465). Plain SMTP is refused.
+relay = ""
+tls = "starttls"
+from = ""
+to = []
+# Optional login (AUTH PLAIN). The password is read from a file readable
+# only by root and the soteria group, never written in this file.
+username = ""
+password_file = ""
+# PEM CA certificates to trust instead of the system store.
+ca_file = ""
+minimum_severity = "high"
+timeout = "30s"
+
+[notifications.webhook]
+# HTTPS endpoint receiving {"source", "hostname", "alerts": [...]} as JSON.
+url = ""
+# Optional bearer token, read from a file (Authorization: Bearer ...).
+token_file = ""
+ca_file = ""
+minimum_severity = "high"
+timeout = "10s"
+
 [alerts]
 # One of: critical, high, medium, low, info
 minimum_severity = "low"

@@ -375,6 +375,8 @@ pub enum ConfigCommand {
     Validate,
     /// Print the default configuration
     Default,
+    /// Send a test message to each enabled notification channel
+    TestNotifications,
 }
 
 #[derive(Debug, Subcommand)]

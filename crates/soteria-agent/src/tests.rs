@@ -621,6 +621,169 @@ arguments = ["--secret-flag"]
     assert!(err.to_string().contains("unknown rule 'NOPE'"), "{err}");
 }
 
+/// A one-shot HTTPS server for `localhost` with a private CA. Returns the
+/// port, the CA file and the request it receives.
+fn webhook_server(
+    dir: &Path,
+    status: &'static str,
+) -> (u16, PathBuf, std::thread::JoinHandle<String>) {
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+    use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+    use std::io::{Read, Write};
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let ca_key = KeyPair::generate().unwrap();
+    let ca = ca_params.self_signed(&ca_key).unwrap();
+    let key = KeyPair::generate().unwrap();
+    let leaf = CertificateParams::new(vec!["localhost".to_owned()])
+        .unwrap()
+        .signed_by(&key, &ca, &ca_key)
+        .unwrap();
+    let ca_file = dir.join("ca.pem");
+    fs::write(&ca_file, ca.pem()).unwrap();
+    let cfg = Arc::new(
+        rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![leaf.der().clone()],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
+        )
+        .unwrap(),
+    );
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let h = std::thread::spawn(move || {
+        let (tcp, _) = listener.accept().unwrap();
+        let mut s = rustls::StreamOwned::new(rustls::ServerConnection::new(cfg).unwrap(), tcp);
+        let mut req = Vec::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = s.read(&mut buf).unwrap();
+            req.extend_from_slice(&buf[..n]);
+            let text = String::from_utf8_lossy(&req).to_string();
+            if let Some(i) = text.find("\r\n\r\n") {
+                let len: usize = text
+                    .lines()
+                    .find_map(|l| l.strip_prefix("Content-Length: "))
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                if req.len() >= i + 4 + len {
+                    break;
+                }
+            }
+        }
+        s.write_all(format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\n\r\n").as_bytes())
+            .unwrap();
+        s.conn.send_close_notify();
+        let _ = s.flush();
+        String::from_utf8(req).unwrap()
+    });
+    (port, ca_file, h)
+}
+
+fn wait_for(agent: &mut Agent, what: &str, mut f: impl FnMut(&Agent) -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !f(agent) {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        agent.step(Duration::from_millis(20)).unwrap();
+    }
+}
+
+fn meta(agent: &Agent, key: &str) -> Option<String> {
+    agent.store().meta(key).unwrap()
+}
+
+#[test]
+fn new_alerts_are_posted_to_the_webhook_once() {
+    let mut f = fixture();
+    // An alert from before notifications were on is not sent.
+    {
+        let mut agent = start(&f, quiet());
+        let conf = f.root.join("etc/app.conf");
+        fs::write(&conf, "old change\n").unwrap();
+        agent.verify_path(&conf, Source::FsEvent).unwrap();
+        agent.shutdown();
+    }
+    let (port, ca_file, server) = webhook_server(f._dir.path(), "200 OK");
+    f.config.alerts.webhook = true;
+    f.config.notifications.webhook.url = format!("https://localhost:{port}/hook");
+    f.config.notifications.webhook.ca_file = ca_file;
+    f.config.notifications.webhook.minimum_severity = Severity::Low;
+    let mut agent = start(&f, quiet());
+    assert_eq!(
+        meta(&agent, "notified_through_webhook").as_deref(),
+        Some("1")
+    );
+
+    let tool = f.root.join("bin/tool");
+    fs::write(&tool, "#!/bin/sh\nevil\n").unwrap();
+    agent.verify_path(&tool, Source::FsEvent).unwrap();
+    wait_for(&mut agent, "delivery", |a| {
+        meta(a, "notified_through_webhook").as_deref() == Some("2")
+    });
+    let req = server.join().unwrap();
+    assert!(req.starts_with("POST /hook HTTP/1.1"), "{req}");
+    let body: serde_json::Value =
+        serde_json::from_str(&req[req.find("\r\n\r\n").unwrap() + 4..]).unwrap();
+    let alerts = body["alerts"].as_array().unwrap();
+    assert_eq!(alerts.len(), 1, "{body}");
+    assert_eq!(alerts[0]["rule_id"], "FIM-003");
+    assert_eq!(alerts[0]["object"], tool.display().to_string());
+    // Nothing new: no second request (the server has gone).
+    agent.step(Duration::from_millis(50)).unwrap();
+    agent.shutdown();
+}
+
+#[test]
+fn failed_delivery_is_reported_and_kept_for_retry() {
+    let mut f = fixture();
+    // Nothing listens on this port.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    f.config.alerts.webhook = true;
+    f.config.notifications.webhook.url = format!("https://localhost:{port}/hook");
+    f.config.notifications.webhook.minimum_severity = Severity::Info;
+    let mut agent = start(&f, quiet());
+    let conf = f.root.join("etc/app.conf");
+    fs::write(&conf, "x\n").unwrap();
+    agent.verify_path(&conf, Source::FsEvent).unwrap();
+    let failed = |a: &Agent| -> i64 {
+        a.store()
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'notification.failed'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    wait_for(&mut agent, "failure", |a| failed(a) == 1);
+    assert_eq!(
+        meta(&agent, "notified_through_webhook").as_deref(),
+        Some("0"),
+        "not marked delivered"
+    );
+    let state: String = agent
+        .store()
+        .connection()
+        .query_row(
+            "SELECT state FROM sensor_health WHERE sensor = 'webhook' ORDER BY id DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, "failing");
+    agent.shutdown();
+}
+
 /// tempfile's default names start with a dot, which counts as a hidden path.
 fn tempdir() -> tempfile::TempDir {
     tempfile::Builder::new()
