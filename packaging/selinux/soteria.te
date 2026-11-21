@@ -1,0 +1,119 @@
+policy_module(soteria, 1.0.0)
+
+########################################
+#
+# Declarations
+#
+# The daemon runs confined in soteria_t. It reads (never writes) the
+# filesystem it monitors, and writes only its own database, runtime and
+# log directories. The CLI runs in the caller's domain.
+
+type soteria_t;
+type soteria_exec_t;
+init_daemon_domain(soteria_t, soteria_exec_t)
+
+# /etc/soteria: configuration, rules and baseline keys.
+type soteria_conf_t;
+files_config_file(soteria_conf_t)
+
+# /var/lib/soteria: the database.
+type soteria_var_lib_t;
+files_type(soteria_var_lib_t)
+
+# /run/soteria and /var/log/soteria.
+type soteria_runtime_t;
+files_type(soteria_runtime_t)
+type soteria_log_t;
+logging_log_file(soteria_log_t)
+
+# The service unit, so changing it needs its own permission.
+type soteria_unit_file_t;
+init_unit_file(soteria_unit_file_t)
+
+########################################
+#
+# Local policy
+#
+
+# Read root-only files for hashing (CAP_DAC_READ_SEARCH), and the kernel
+# audit multicast stream for executions (CAP_AUDIT_READ). Nothing else.
+allow soteria_t self:capability dac_read_search;
+allow soteria_t self:capability2 audit_read;
+allow soteria_t self:netlink_audit_socket { create bind getattr setopt read nlmsg_read };
+allow soteria_t self:process { getsched signal };
+allow soteria_t self:fifo_file rw_fifo_file_perms;
+allow soteria_t self:unix_dgram_socket create_socket_perms;
+allow soteria_t self:unix_stream_socket create_stream_socket_perms;
+allow soteria_t self:tcp_socket create_stream_socket_perms;
+allow soteria_t self:udp_socket create_socket_perms;
+
+# Own files.
+read_files_pattern(soteria_t, soteria_conf_t, soteria_conf_t)
+list_dirs_pattern(soteria_t, soteria_conf_t, soteria_conf_t)
+manage_files_pattern(soteria_t, soteria_var_lib_t, soteria_var_lib_t)
+manage_dirs_pattern(soteria_t, soteria_var_lib_t, soteria_var_lib_t)
+manage_files_pattern(soteria_t, soteria_runtime_t, soteria_runtime_t)
+manage_dirs_pattern(soteria_t, soteria_runtime_t, soteria_runtime_t)
+manage_files_pattern(soteria_t, soteria_log_t, soteria_log_t)
+manage_dirs_pattern(soteria_t, soteria_log_t, soteria_log_t)
+files_search_var_lib(soteria_t)
+read_files_pattern(soteria_t, soteria_unit_file_t, soteria_unit_file_t)
+allow soteria_t soteria_exec_t:file read_file_perms;
+
+# Inventory and integrity monitoring (FR-001..FR-004, FR-014): read and
+# hash every file, follow no symlink, stat everything else, and watch
+# directories with inotify.
+files_list_all(soteria_t)
+files_read_all_files(soteria_t)
+files_read_all_symlinks(soteria_t)
+files_getattr_all_files(soteria_t)
+files_getattr_all_symlinks(soteria_t)
+files_getattr_all_pipes(soteria_t)
+files_getattr_all_sockets(soteria_t)
+dev_getattr_all_chr_files(soteria_t)
+dev_getattr_all_blk_files(soteria_t)
+fs_getattr_all_fs(soteria_t)
+files_read_kernel_img(soteria_t)
+files_read_kernel_modules(soteria_t)
+corecmd_read_all_executables(soteria_t)
+selinux_getattr_fs(soteria_t)
+selinux_get_enforce_mode(soteria_t)
+
+# Accounts (FR-025): password state is read from shadow; hashes are never
+# stored.
+auth_read_shadow(soteria_t)
+
+# Execution monitoring (FR-009): resolve and hash the programs of other
+# processes through /proc.
+domain_read_all_domains_state(soteria_t)
+
+# Kernel and boot state (FR-022..FR-024).
+kernel_read_system_state(soteria_t)
+kernel_read_kernel_sysctls(soteria_t)
+dev_read_sysfs(soteria_t)
+fs_read_efivarfs_files(soteria_t)
+dev_read_urand(soteria_t)
+
+# systemd readiness and watchdog; journald.
+init_dgram_send(soteria_t)
+init_read_state(soteria_t)
+logging_send_syslog_msg(soteria_t)
+
+# Notifications (FR-031): SMTP relay and HTTPS webhooks, verified against
+# the system trust store.
+sysnet_dns_name_resolve(soteria_t)
+corenet_tcp_connect_smtp_port(soteria_t)
+corenet_tcp_connect_http_port(soteria_t)
+miscfiles_read_generic_certs(soteria_t)
+
+# Administrators who send notifications through other ports enable this.
+## <desc>
+## <p>
+## Allow the Soteria daemon to connect to any TCP port, for SMTP relays
+## and webhooks on non-standard ports.
+## </p>
+## </desc>
+gen_tunable(soteria_connect_any, false)
+tunable_policy(`soteria_connect_any',`
+	corenet_tcp_connect_all_ports(soteria_t)
+')

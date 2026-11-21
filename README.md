@@ -20,9 +20,9 @@ comparison, live file integrity monitoring with scheduled reconciliation,
 execution monitoring through the kernel audit stream (classification,
 unusual locations, lineage, search), and detection handling: configurable
 rules, alert lifecycle and suppression, incidents, retention, exports,
-reports, and email and webhook notifications. Kernel, persistence and
-account monitoring arrive in a later milestone; commands that are not
-available yet say so and exit with code 7.
+reports, and email and webhook notifications, persistence, account,
+kernel and boot monitoring, self-integrity, and SELinux and AppArmor
+confinement (`packaging/selinux`, `packaging/apparmor`).
 
 Execution monitoring needs auditd and the rules file
 `packaging/audit/soteria.rules` (see [docs/CLI.md](docs/CLI.md#execution-monitoring)).
@@ -50,6 +50,7 @@ sudo cp packaging/audit/soteria.rules /etc/audit/rules.d/ && sudo augenrules --l
 sudo -E soteria daemon &          # live monitoring in the foreground
 soteria alerts list; soteria events --since 10m; soteria processes --since 10m
 soteria alerts incidents; soteria report summary
+sudo -E soteria scan --kernel     # kernel, boot parameters, Secure Boot, modules
 ```
 
 ## Layout
@@ -70,6 +71,8 @@ soteria alerts incidents; soteria report summary
 | `packaging/config/soteria.toml` | Default `/etc/soteria/soteria.toml` |
 | `packaging/systemd/soteria.service` | Hardened systemd unit |
 | `packaging/audit/soteria.rules` | auditd rule that reports program executions |
+| `packaging/selinux/` | SELinux policy module (`make -f /usr/share/selinux/devel/Makefile soteria.pp && semodule -i soteria.pp && restorecon -R /usr/bin/soteria /etc/soteria /var/lib/soteria`) |
+| `packaging/apparmor/usr.bin.soteria` | AppArmor profile (`apparmor_parser -r`) |
 
 ## Security limitations
 

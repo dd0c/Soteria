@@ -57,7 +57,55 @@ const SECURITY_SENSITIVE: &[&str] = &[
     "/etc/yum.repos.d/",
     "/etc/pki/rpm-gpg/",
     "/etc/soteria/",
+    // Network configuration (FR-019).
+    "/etc/hosts.allow",
+    "/etc/hosts.deny",
+    "/etc/NetworkManager/",
+    "/etc/network/",
+    "/etc/netplan/",
+    "/etc/systemd/network/",
+    "/etc/sysconfig/network",
+    "/etc/sysconfig/network-scripts/",
+    "/etc/iptables/",
+    "/etc/sysconfig/iptables",
+    "/etc/sysconfig/ip6tables",
+    // Privilege configuration.
+    "/etc/sudo.conf",
+    "/etc/doas.conf",
+    "/etc/subuid",
+    "/etc/subgid",
+    "/etc/polkit-1/",
+    // Start-up hooks (FR-020).
+    "/etc/rc.local",
+    "/etc/rc.d/rc.local",
+    "/etc/xdg/autostart/",
 ];
+
+/// Persistence locations inside a home directory (FR-020), relative to the
+/// home. Directory entries end with '/'.
+const HOME_PERSISTENCE: &[&str] = &[
+    ".ssh/",
+    ".bashrc",
+    ".bash_profile",
+    ".bash_login",
+    ".bash_logout",
+    ".profile",
+    ".zshrc",
+    ".zprofile",
+    ".zshenv",
+    ".zlogin",
+    ".config/autostart/",
+];
+
+/// The part of `path` after `/root/` or `/home/<user>/`.
+fn in_home(path: &str) -> Option<&str> {
+    if let Some(rest) = path.strip_prefix("/root/") {
+        return Some(rest);
+    }
+    let rest = path.strip_prefix("/home/")?;
+    let (_user, rest) = rest.split_once('/')?;
+    Some(rest)
+}
 
 const SCHEDULED: &[&str] = &[
     "/etc/crontab",
@@ -168,6 +216,16 @@ pub fn classify(path: &Path, file_type: FileType, mode: u32, magic: Magic) -> Fi
 
     if matches(&p, SECURITY_SENSITIVE) {
         return FileKind::SecuritySensitive;
+    }
+    if let Some(rest) = in_home(&p) {
+        if matches(rest, HOME_PERSISTENCE) {
+            return FileKind::SecuritySensitive;
+        }
+        if rest.starts_with(".config/systemd/user/")
+            && UNIT_SUFFIXES.iter().any(|s| name.ends_with(s))
+        {
+            return FileKind::ServiceUnit;
+        }
     }
     if matches(&p, SCHEDULED) {
         return FileKind::ScheduledJob;
@@ -348,5 +406,29 @@ mod tests {
         assert!(matches("/etc/ssh/sshd_config", SECURITY_SENSITIVE));
         assert!(!matches("/etc/sshguard.conf", SECURITY_SENSITIVE));
         assert!(!matches("/etc/passwd-", SECURITY_SENSITIVE));
+    }
+
+    #[test]
+    fn home_persistence_files_are_security_sensitive() {
+        use FileKind::*;
+        assert_eq!(
+            reg("/home/alice/.ssh/authorized_keys", 0o600, b"ssh-"),
+            SecuritySensitive
+        );
+        assert_eq!(reg("/root/.bashrc", 0o644, b"# .bashrc"), SecuritySensitive);
+        assert_eq!(
+            reg("/home/bob/.config/autostart/x.desktop", 0o644, b"["),
+            SecuritySensitive
+        );
+        assert_eq!(
+            reg("/home/bob/.config/systemd/user/x.service", 0o644, b"["),
+            ServiceUnit
+        );
+        assert_eq!(reg("/home/bob/notes.txt", 0o644, b"hi"), Other);
+        assert_eq!(reg("/home/.bashrc", 0o644, b"#"), Other);
+        assert_eq!(
+            reg("/etc/NetworkManager/system-connections/w", 0o600, b"["),
+            SecuritySensitive
+        );
     }
 }

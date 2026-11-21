@@ -1,0 +1,10 @@
+/usr/bin/soteria		--	gen_context(system_u:object_r:soteria_exec_t,s0)
+
+/etc/soteria(/.*)?			gen_context(system_u:object_r:soteria_conf_t,s0)
+
+/var/lib/soteria(/.*)?			gen_context(system_u:object_r:soteria_var_lib_t,s0)
+/run/soteria(/.*)?			gen_context(system_u:object_r:soteria_runtime_t,s0)
+/var/log/soteria(/.*)?			gen_context(system_u:object_r:soteria_log_t,s0)
+
+/usr/lib/systemd/system/soteria\.service	--	gen_context(system_u:object_r:soteria_unit_file_t,s0)
+/etc/systemd/system/soteria\.service	--	gen_context(system_u:object_r:soteria_unit_file_t,s0)

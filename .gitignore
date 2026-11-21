@@ -1,1 +1,5 @@
 /target
+
+# SELinux module build output
+packaging/selinux/tmp/
+packaging/selinux/*.pp

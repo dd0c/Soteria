@@ -1,0 +1,78 @@
+# AppArmor profile for the Soteria daemon (Debian, Ubuntu, SUSE).
+#
+# Soteria must read the whole filesystem it monitors, so the profile does
+# not narrow reads; what it removes is everything else: writing outside
+# its own directories, executing other programs, ptrace, mounts, raw
+# sockets and module loading. The CLI shares the binary: commands run by
+# an administrator are confined by the same profile, which is why the
+# database, configuration and key paths are writable here.
+#
+# Install: cp usr.bin.soteria /etc/apparmor.d/ && apparmor_parser -r /etc/apparmor.d/usr.bin.soteria
+
+abi <abi/3.0>,
+
+include <tunables/global>
+
+profile soteria /usr/bin/soteria flags=(attach_disconnected) {
+  include <abstractions/base>
+  include <abstractions/nameservice>
+  include <abstractions/ssl_certs>
+
+  # CAP_DAC_READ_SEARCH: hash root-only files. CAP_AUDIT_READ: join the
+  # kernel audit stream for executions. The CLI run as root also needs
+  # to read and own its key and database files.
+  capability dac_read_search,
+  capability audit_read,
+  capability dac_override,
+  capability chown,
+  capability fowner,
+
+  network netlink raw,
+  network unix stream,
+  network unix dgram,
+  # SMTP and HTTPS notifications.
+  network inet stream,
+  network inet6 stream,
+  network inet dgram,
+  network inet6 dgram,
+
+  # Read everything, follow nothing: inventory, integrity, accounts,
+  # kernel state, and the programs of other processes.
+  / r,
+  /** r,
+  @{PROC}/ r,
+  @{PROC}/** r,
+  @{PROC}/[0-9]*/exe r,
+  /sys/** r,
+  ptrace (read),
+
+  # The program itself.
+  /usr/bin/soteria mr,
+
+  # Own state.
+  /etc/soteria/ rw,
+  /etc/soteria/** rwk,
+  /var/lib/soteria/ rw,
+  /var/lib/soteria/** rwk,
+  /run/soteria/ rw,
+  /run/soteria/** rwk,
+  /var/log/soteria/ rw,
+  /var/log/soteria/** rw,
+
+  # systemd readiness and watchdog.
+  /run/systemd/notify w,
+
+  # Nothing executes other programs, except the execution-monitoring
+  # self-test, which runs /bin/true.
+  /{usr/,}bin/true ix,
+
+  deny mount,
+  deny umount,
+  deny pivot_root,
+  deny capability sys_module,
+  deny capability sys_admin,
+  deny capability sys_ptrace,
+
+  # Site-specific additions.
+  include if exists <local/usr.bin.soteria>
+}

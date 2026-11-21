@@ -6,14 +6,18 @@
 //! re-verifies paths whose events have settled, accounts for lost events,
 //! and runs scans that are due.
 
+pub mod accounts;
 pub mod alerts;
 pub mod exec;
 mod exec_sensor;
 pub mod incidents;
+pub mod kernel;
 pub mod lifecycle;
 mod notify;
 pub mod retention;
 pub mod rules;
+pub mod scope;
+pub mod selfcheck;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -71,6 +75,8 @@ pub enum AgentError {
     Scan(#[from] scan::ScanError),
     #[error(transparent)]
     Rules(#[from] soteria_rules::RulesError),
+    #[error(transparent)]
+    Store(#[from] soteria_store::StoreError),
 }
 
 pub type Result<T> = std::result::Result<T, AgentError>;
@@ -90,6 +96,15 @@ pub struct Options {
     /// Join the kernel audit stream for executions. Tests that feed
     /// executions directly turn it off.
     pub exec_sensor: bool,
+    /// The configuration file in use, monitored as one of Soteria's own
+    /// files (FR-036). `None`: the default location.
+    pub config_path: Option<PathBuf>,
+    /// The previous run did not stop cleanly (FR-037): raise SELF-002.
+    pub interrupted: Option<selfcheck::Interruption>,
+    /// Where account files are read from (tests use a temporary root).
+    pub accounts: accounts::Sources,
+    /// Where kernel state is read from (tests use a temporary root).
+    pub kernel: kernel::Sources,
 }
 
 impl Default for Options {
@@ -100,6 +115,10 @@ impl Default for Options {
             max_delay: Duration::from_millis(1500),
             startup_scan: true,
             exec_sensor: true,
+            config_path: None,
+            interrupted: None,
+            accounts: accounts::Sources::default(),
+            kernel: kernel::Sources::default(),
         }
     }
 }
@@ -162,26 +181,52 @@ pub struct Agent {
     next_retention: Instant,
     /// Email and webhook delivery, when enabled.
     notifier: Option<notify::Notifier>,
+    /// Soteria's own files (FR-036).
+    own_files: Vec<PathBuf>,
+    /// Account sources, when account monitoring is enabled (FR-025).
+    accounts: Option<accounts::Sources>,
+    /// An account source changed: compare at the next step.
+    accounts_due: bool,
+    /// Kernel sources, when kernel monitoring is enabled (FR-022..024).
+    kernel: Option<kernel::Sources>,
+    next_kernel: Instant,
 }
 
 impl Agent {
     /// Start sensors and record what is and is not being monitored, so no
     /// capability is shown as active when it is not (SRS 4.7).
     pub fn start(config: Config, store: Store, options: Options) -> Result<Agent> {
-        let scope = Scope {
-            include: config.paths.include.clone(),
-            exclude: config.paths.exclude.clone(),
-        };
+        let scope = scope::for_config(&config, options.config_path.as_deref());
         // Invalid rules stop the agent: running without them would silently
         // weaken detection (FR-043).
         let rules = Arc::new(RuleSet::load(&config.general.rules_directory)?);
         rules::sync(store.connection(), &rules)?;
+        if let Some(i) = &options.interrupted {
+            selfcheck::report(
+                &store,
+                &soteria_platform::hostname(),
+                i,
+                Policy {
+                    minimum: config.alerts.minimum_severity,
+                    rules: &rules,
+                },
+            )?;
+        }
         let now_i = Instant::now();
         let startup_scan = options.startup_scan && config.scanning.startup_scan;
         let mut agent = Agent {
             rules,
             // Not at once: the startup scan comes first.
             next_retention: now_i + RETENTION_FIRST,
+            accounts: config.monitoring.users.then(|| options.accounts.clone()),
+            accounts_due: false,
+            kernel: config.monitoring.kernel.then(|| options.kernel.clone()),
+            next_kernel: now_i + kernel::POLL,
+            own_files: if config.paths.own_files {
+                scope::self_paths(&config, options.config_path.as_deref())
+            } else {
+                Vec::new()
+            },
             notifier: notify::Notifier::start(&config, &soteria_platform::hostname(), &store)?,
             next_full: if startup_scan {
                 now_i
@@ -216,32 +261,39 @@ impl Agent {
 
         agent.refresh_baseline()?;
 
-        // Monitors that arrive in later milestones are recorded as
-        // unavailable rather than silently absent.
-        let m = &agent.config.monitoring;
-        let planned = [
-            (
-                "kernel",
-                m.kernel,
-                "kernel and boot monitoring arrives in a later release",
-            ),
-            (
+        if !agent.config.monitoring.persistence {
+            agent.health("persistence", "disabled", Some("disabled by configuration"));
+        } else if !agent.config.monitoring.file_integrity {
+            agent.health(
                 "persistence",
-                m.persistence,
-                "persistence monitoring arrives in a later release",
-            ),
-            (
-                "users",
-                m.users,
-                "account monitoring arrives in a later release",
-            ),
-        ];
-        for (sensor, enabled, detail) in planned {
-            if enabled {
-                agent.health(sensor, "unavailable", Some(detail));
-            } else {
-                agent.health(sensor, "disabled", Some("disabled by configuration"));
-            }
+                "unavailable",
+                Some("persistence locations are watched by file integrity monitoring, which is disabled"),
+            );
+        } else {
+            let n = agent.config.paths.persistence.len();
+            agent.health(
+                "persistence",
+                "running",
+                Some(&format!("{n} persistence location pattern(s) monitored")),
+            );
+        }
+        if agent.config.monitoring.kernel {
+            agent.check_kernel()?;
+        } else {
+            agent.health(
+                kernel::SENSOR,
+                "disabled",
+                Some("disabled by configuration"),
+            );
+        }
+        if agent.config.monitoring.users {
+            agent.check_accounts()?;
+        } else {
+            agent.health(
+                accounts::SENSOR,
+                "disabled",
+                Some("disabled by configuration"),
+            );
         }
         if !agent.config.monitoring.configuration {
             agent.health(
@@ -391,6 +443,10 @@ impl Agent {
             self.critical_scan()?;
             self.next_critical = Instant::now() + self.config.scanning.critical_scan_interval.0;
         }
+        if now_i >= self.next_kernel {
+            self.check_kernel()?;
+            self.next_kernel = Instant::now() + kernel::POLL;
+        }
         self.after_alerts()?;
         Ok(())
     }
@@ -431,8 +487,18 @@ impl Agent {
         let paths: Vec<PathBuf> = self.pending.drain().map(|(p, _)| p).collect();
         for p in paths {
             self.verify_path(&p, Source::FsEvent)?;
+            self.note_account_source(&p);
+        }
+        if self.accounts_due {
+            self.check_accounts()?;
         }
         Ok(())
+    }
+
+    fn note_account_source(&mut self, path: &Path) {
+        if self.accounts.as_ref().is_some_and(|s| s.is_source(path)) {
+            self.accounts_due = true;
+        }
     }
 
     fn process_due(&mut self) -> Result<()> {
@@ -447,6 +513,10 @@ impl Agent {
         for path in due {
             self.pending.remove(&path);
             self.verify_path(&path, Source::FsEvent)?;
+            self.note_account_source(&path);
+        }
+        if self.accounts_due {
+            self.check_accounts()?;
         }
         Ok(())
     }
@@ -491,7 +561,7 @@ impl Agent {
     }
 
     fn in_scope(&self, path: &Path) -> bool {
-        !self.scope.is_excluded(path) && self.scope.include.iter().any(|r| path.starts_with(r))
+        self.scope.contains(path)
     }
 
     /// Re-read one object, update the inventory, record an event if it
@@ -592,6 +662,7 @@ impl Agent {
             source,
             baseline_version: version,
             hostname: &self.hostname,
+            own_file: scope::is_self_path(&self.own_files, &change.path),
         };
         if let Raised::Created { id, .. } = alerts::raise(
             self.store.connection(),
@@ -741,6 +812,7 @@ impl Agent {
                 Some("recovered after reconciliation"),
             );
         }
+        self.check_accounts()?;
         self.last_reconciliation = Some(now());
         self.scan_state = "idle".into();
         Ok(())

@@ -123,11 +123,9 @@ pub fn user_name(uid: u32) -> Option<String> {
 }
 
 /// Inventory scope from configuration.
-pub fn scope(config: &Config) -> soteria_inventory::Scope {
-    soteria_inventory::Scope {
-        include: config.paths.include.clone(),
-        exclude: config.paths.exclude.clone(),
-    }
+/// The same scope the daemon monitors, so scans and baselines agree with it.
+pub fn scope(config: &Config, config_path: &Path) -> soteria_inventory::Scope {
+    soteria_agent::scope::for_config(config, Some(config_path))
 }
 
 /// Open the database for writing (scans, baseline changes).

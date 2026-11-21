@@ -77,8 +77,12 @@ pub enum Category {
     File,
     /// Program executions.
     Execution,
-    /// Soteria's own baseline and database integrity.
+    /// Soteria's own baseline, files and service health.
     Integrity,
+    /// Accounts, groups, sudo rights and SSH keys.
+    Account,
+    /// Running kernel, modules and boot context.
+    Kernel,
 }
 
 impl Category {
@@ -87,6 +91,8 @@ impl Category {
             Category::File => "file",
             Category::Execution => "execution",
             Category::Integrity => "integrity",
+            Category::Account => "account",
+            Category::Kernel => "kernel",
         }
     }
 }
@@ -569,7 +575,7 @@ impl RuleSet {
                     }
                     Matcher::Execution(m)
                 }
-                Category::Integrity => {
+                Category::Integrity | Category::Account | Category::Kernel => {
                     problem(format!(
                         "rule '{}': 'on' must be \"file\" or \"execution\"",
                         d.id

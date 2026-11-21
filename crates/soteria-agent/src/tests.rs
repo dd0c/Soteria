@@ -34,6 +34,8 @@ fn fixture() -> Fixture {
     let mut config = Config::default();
     config.general.database = db.clone();
     config.paths.include = vec![root.clone()];
+    config.paths.persistence = vec![];
+    config.paths.own_files = false;
     config.paths.exclude = vec![];
     config.baseline.signing_key = sk.clone();
     config.baseline.public_key = pk;
@@ -46,6 +48,7 @@ fn fixture() -> Fixture {
     let scope = Scope {
         include: config.paths.include.clone(),
         exclude: vec![],
+        optional: Vec::new(),
     };
     scan::run(&mut store, &scope, &ScanTarget::Full, "full").unwrap();
     let draft = baseline::create_draft(&mut store, "test", None).unwrap();
@@ -277,6 +280,8 @@ fn without_baseline_changes_are_recorded_but_not_alerted() {
     config.general.database = dir.path().join("db");
     config.general.rules_directory = dir.path().join("rules.d");
     config.paths.include = vec![root.clone()];
+    config.paths.persistence = vec![];
+    config.paths.own_files = false;
     config.paths.exclude = vec![];
     let (store, _) = Store::create_or_migrate(&config.general.database).unwrap();
     let mut agent = Agent::start(config, store, quiet()).unwrap();
@@ -499,6 +504,8 @@ fn without_baseline_executions_are_unverified() {
     config.general.database = dir.path().join("db");
     config.general.rules_directory = dir.path().join("rules.d");
     config.paths.include = vec![dir.path().to_owned()];
+    config.paths.persistence = vec![];
+    config.paths.own_files = false;
     config.execution.unusual_paths = vec![];
     let (store, _) = Store::create_or_migrate(&config.general.database).unwrap();
     let mut agent = Agent::start(config, store, quiet()).unwrap();
@@ -790,4 +797,96 @@ fn tempdir() -> tempfile::TempDir {
         .prefix("soteria-test")
         .tempdir()
         .unwrap()
+}
+
+#[test]
+fn account_changes_raise_alerts_through_file_events() {
+    let f = fixture();
+    let etc = f.root.join("etc");
+    fs::write(etc.join("passwd"), "root:x:0:0::/root:/bin/bash\n").unwrap();
+    fs::write(etc.join("group"), "root:x:0:\nwheel:x:10:\n").unwrap();
+    let mut options = quiet();
+    options.accounts = accounts::Sources {
+        root: f.root.clone(),
+    };
+    let mut agent = start(&f, options);
+    // The first snapshot is the reference: nothing to report.
+    assert!(!alerts(&agent).iter().any(|a| a.0.starts_with("ACC-")));
+
+    fs::write(
+        etc.join("passwd"),
+        "root:x:0:0::/root:/bin/bash\nsupport:x:0:0::/tmp:/bin/bash\n",
+    )
+    .unwrap();
+    wait_for(&mut agent, "account alerts", |a| {
+        alerts(a).iter().any(|x| x.0 == "ACC-004")
+    });
+    let a = alerts(&agent);
+    let uid0 = a.iter().find(|x| x.0 == "ACC-004").unwrap();
+    // Named as on the host, so it correlates with the file alert.
+    assert_eq!(uid0.1, "/etc/passwd");
+    assert_eq!(uid0.2, "critical");
+    // Unchanged on the next check: nothing new.
+    let n = a.len();
+    agent.check_accounts().unwrap();
+    assert_eq!(alerts(&agent).len(), n);
+    agent.shutdown();
+}
+
+#[test]
+fn changes_to_own_files_are_critical() {
+    let mut f = fixture();
+    let cfg = f.root.join("etc/app.conf");
+    f.config.paths.own_files = true;
+    let mut options = quiet();
+    options.config_path = Some(cfg.clone());
+    let mut agent = start(&f, options);
+    fs::write(&cfg, "a = 2\n").unwrap();
+    agent.verify_path(&cfg, Source::FsEvent).unwrap();
+    let a = alerts(&agent);
+    assert_eq!(a.len(), 1, "{a:?}");
+    assert_eq!(a[0].0, "SELF-001");
+    assert_eq!(a[0].2, "critical");
+    agent.shutdown();
+}
+
+#[test]
+fn an_unclean_stop_is_reported_at_start() {
+    let f = fixture();
+    let (store, _) = Store::create_or_migrate(&f.db).unwrap();
+    store.record_health("agent", "running", None).unwrap();
+    let previous = selfcheck::previous_run(&store).unwrap();
+    assert!(previous.is_some());
+    let mut options = quiet();
+    options.interrupted = previous;
+    let agent = Agent::start(f.config.clone(), store, options).unwrap();
+    assert!(alerts(&agent).iter().any(|a| a.0 == "SELF-002"));
+    agent.shutdown();
+}
+
+#[test]
+fn untrusted_setuid_transition_is_reported() {
+    let f = fixture();
+    let mut agent = start(&f, quiet());
+    let new = f.root.join("bin/rootme");
+    fs::write(&new, "#!/bin/sh\nid\n").unwrap();
+    let mut ev = exec_event(11, 1, &new, &["rootme"]);
+    ev.euid = 0;
+    agent.handle_exec(&ev).unwrap();
+    assert!(
+        rules(&agent).contains(&"EXE-006".to_owned()),
+        "{:?}",
+        rules(&agent)
+    );
+
+    // A trusted program (in the baseline, unchanged) is not reported.
+    let tool = f.root.join("bin/tool");
+    let mut ev = exec_event(12, 1, &tool, &["tool"]);
+    ev.euid = 0;
+    let h = agent.handle_exec(&ev).unwrap();
+    if h.classification == exec::Classification::Trusted {
+        let n = rules(&agent).iter().filter(|r| *r == "EXE-006").count();
+        assert_eq!(n, 1);
+    }
+    agent.shutdown();
 }

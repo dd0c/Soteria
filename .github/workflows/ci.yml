@@ -57,3 +57,21 @@ jobs:
           chmod a+x "$HOME"
           chmod -R a+rX "$HOME/.rustup" "$HOME/.cargo/bin"
           su tester -c "PATH=$HOME/.cargo/bin:/usr/bin:/bin RUSTUP_HOME=$HOME/.rustup CARGO_HOME=/home/tester/.cargo CARGO_TARGET_DIR=/home/tester/target cargo test --workspace --locked"
+
+  # The SELinux module is built against Fedora's policy (the closest to
+  # RHEL's that a container offers); the AppArmor profile is parsed.
+  selinux:
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:latest
+    steps:
+      - run: dnf install -y selinux-policy-devel make
+      - uses: actions/checkout@v4
+      - run: make -f /usr/share/selinux/devel/Makefile -C packaging/selinux soteria.pp
+
+  apparmor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y apparmor
+      - run: apparmor_parser -Q -K -T packaging/apparmor/usr.bin.soteria
