@@ -226,13 +226,27 @@ pub fn correlate(conn: &Connection, id: i64, window: Duration) -> rusqlite::Resu
             best = Some(relation);
         }
     }
-    let Some((_, title)) = best else {
+    let Some((relation, title)) = best else {
         return Ok(None);
     };
 
     let ts = now();
     let incident = match rows.iter().find_map(|r| r.3) {
-        Some(existing) => existing,
+        Some(existing) => {
+            // A changed program that then ran says more than any other
+            // relation, so it names the incident.
+            if relation == Relation::ChangedThenRun {
+                conn.execute(
+                    "UPDATE incidents SET title = ?2 WHERE id = ?1",
+                    params![existing, title],
+                )?;
+            }
+            conn.execute(
+                "UPDATE incidents SET updated_at = ?2 WHERE id = ?1",
+                params![existing, ts],
+            )?;
+            existing
+        }
         None => {
             conn.execute(
                 "INSERT INTO incidents (created_at, updated_at, severity, title, status) VALUES (?1, ?1, 'info', ?2, 'open')",
@@ -410,6 +424,44 @@ mod tests {
             })
             .unwrap();
         assert_eq!(status, "closed");
+    }
+
+    #[test]
+    fn running_a_changed_program_retitles_the_incident() {
+        let (_d, s) = store();
+        let c = s.connection();
+        add(
+            &s,
+            "2026-11-21T10:00:00.000Z",
+            "file_integrity",
+            "high",
+            "/opt/x",
+            json!({}),
+        );
+        add(
+            &s,
+            "2026-11-21T10:00:00.000Z",
+            "file_integrity",
+            "critical",
+            "/opt/x",
+            json!({}),
+        );
+        correlate_pending(c, H).unwrap();
+        let title = || -> String {
+            c.query_row("SELECT title FROM incidents", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(title(), "Repeated detections on /opt/x");
+        add(
+            &s,
+            "2026-11-21T10:01:00.000Z",
+            "execution",
+            "high",
+            "/opt/x",
+            json!({ "process": { "id": 1, "exe": "/opt/x" } }),
+        );
+        correlate_pending(c, H).unwrap();
+        assert_eq!(title(), "Changed program executed: /opt/x");
     }
 
     #[test]

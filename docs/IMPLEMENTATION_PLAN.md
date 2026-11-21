@@ -43,7 +43,7 @@ cannot do.
 | M6 | System monitoring and hardening | 6 | FR-019/020, FR-022..027, NFR-008..016 | Config, persistence, account, kernel/boot monitoring, self-integrity, privileged helper with authenticated IPC, SELinux policy module, AppArmor profile, systemd hardening |
 | M7 | Packaging and release | 7 | 9, 11, 12, 13 | RPM (RHEL 9/10), DEB (Debian 13), install/upgrade/remove scripts, container-based test matrix, benchmarks, admin documentation |
 
-Progress: M1 to M3 merged (PRs #1 to #3). M4 in review.
+Progress: M1 to M4 merged (PRs #1 to #4). M5 in review.
 
 ## Key design choices (proposed)
 
@@ -91,8 +91,9 @@ Progress: M1 to M3 merged (PRs #1 to #3). M4 in review.
 6. Baseline comparison ignores ctime-only changes (any chmod, chown or link
    count change updates ctime), and reports size/mtime/inode changes without
    any other difference as `metadata_modified` at `info` severity.
-7. Change severities in M2 are fixed defaults; the M5 rule engine makes them
-   configurable (FR-021).
+7. Change severities in M2 are fixed defaults; M5 lets administrators
+   disable any built-in rule or fix its severity, and add file and
+   execution rules, in `/etc/soteria/rules.d/*.toml` (FR-021, docs/RULES.md).
 8. The filesystem sensor is inotify only (decided 2026-11-21); fanotify
    would need `CAP_SYS_ADMIN`. inotify does not identify the process that
    made a change, so integrity alerts record the actor as unknown until
@@ -113,11 +114,37 @@ Progress: M1 to M3 merged (PRs #1 to #3). M4 in review.
 13. Classification applies to the program image the kernel loaded. When an
     interpreter runs a script, the script is checked for unusual location
     and recent change, but it is not hashed.
-14. Execution severities and the service and shell lists for EXE-004 are
-    built in; the M5 rule engine makes them configurable.
+14. Execution severities are configurable through rule overrides (M5). The
+    service and shell lists for EXE-004 stay built in; administrators who
+    need more add an execution rule with `parents` and `programs`.
 15. The daemon applies pending database migrations at start, so a package
     upgrade needs no manual step. CLI commands still refuse an outdated
     database and point to `soteria init`.
 16. Configuration gains an `[execution]` section: argument privacy,
     `max_argument_bytes`, `hash_max_bytes`, `unusual_paths` and
     `recent_change`.
+17. Rules are TOML files, not a rule language: built-in rules can be
+    disabled or given a fixed severity, and administrator rules match file
+    deviations (path globs, change kinds) or executions (program, parent,
+    user, classification, argument). Invalid rule files stop the daemon
+    (FR-043). Configuration gains `general.rules_directory`.
+18. Incidents (FR-018) group alerts raised within
+    `alerts.correlation_window` (new, default 1h) on the same object, a
+    changed file and its execution, one login session, or a parent and
+    child process. A single alert is not an incident. inotify still cannot
+    name the process that changed a file, so a change is linked to later
+    executions of that file, not to the process that wrote it.
+19. Notifications (FR-031): the daemon itself sends mail to an SMTP relay
+    (STARTTLS or implicit TLS, never plain) and posts JSON to HTTPS
+    webhooks, using rustls with the system trust store (decided
+    2026-11-21; local sendmail would fail under `NoNewPrivileges`). The unit
+    therefore allows `AF_INET`/`AF_INET6`. Configuration gains
+    `[notifications.email]` and `[notifications.webhook]`. Each channel keeps
+    a delivery cursor in the database: at-least-once delivery, no backlog
+    when a channel is first enabled.
+20. Retention deletes events and execution records past
+    `event_retention_days` hourly, but keeps anything an alert cites;
+    alerts, incidents and baselines are never deleted.
+21. CLI additions beyond SRS 6: `alerts close|reopen|note|suppressions|
+    unsuppress|incidents|incident`, `rules validate`, `report scans`, and
+    `config test-notifications`.

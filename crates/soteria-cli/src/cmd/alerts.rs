@@ -582,7 +582,7 @@ fn write_csv(w: &mut dyn Write, details: &[AlertDetail]) -> std::io::Result<()> 
 /// RFC 4180 quoting. Fields that a spreadsheet would run as a formula are
 /// prefixed with a quote, so an exported path cannot inject one.
 fn csv_field(v: &str) -> String {
-    let v = if v.starts_with(['=', '+', '-', '@']) {
+    let v = if v.starts_with(['=', '+', '-', '@', '\t', '\r']) {
         format!("'{v}")
     } else {
         v.to_owned()
