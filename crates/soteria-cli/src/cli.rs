@@ -203,7 +203,7 @@ pub struct InventoryArgs {
     pub limit: u32,
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, Args)]
 pub struct TimeRange {
     /// Start time (RFC 3339) or age such as "2h"
     #[arg(long)]
@@ -233,34 +233,88 @@ pub enum AlertsCommand {
     /// List and filter alerts
     List {
         #[command(flatten)]
-        range: TimeRange,
-        #[arg(long)]
-        severity: Option<String>,
-        #[arg(long)]
-        status: Option<String>,
+        filter: AlertFilter,
         /// Maximum number of rows
         #[arg(long, default_value_t = 100)]
         limit: u32,
     },
-    /// Show one alert with its evidence
+    /// Show one alert with its evidence and history
     Show { id: u64 },
     /// Acknowledge an alert (evidence is kept unchanged)
-    Ack { id: u64 },
+    Ack {
+        id: u64,
+        #[arg(long)]
+        note: Option<String>,
+    },
     /// Mark an alert as investigated
-    Investigate { id: u64 },
+    Investigate {
+        id: u64,
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Close an alert (the same detection may be raised again)
+    Close {
+        id: u64,
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Reopen an alert
+    Reopen {
+        id: u64,
+        #[arg(long)]
+        note: Option<String>,
+    },
     /// Add a note to an alert
     Note { id: u64, text: String },
     /// Suppress a known benign detection
     Suppress {
         id: u64,
+        /// Why this detection is benign (recorded with your name)
         #[arg(long)]
         reason: String,
+        /// Suppress this rule for every object, not just this one
+        #[arg(long)]
+        all_objects: bool,
+        /// Let the suppression lapse after this long, such as "30d"
+        #[arg(long)]
+        expires: Option<String>,
     },
-    /// Export alerts
+    /// List suppressions
+    Suppressions {
+        /// Include removed suppressions
+        #[arg(long)]
+        all: bool,
+    },
+    /// Remove a suppression
+    Unsuppress { suppression_id: u64 },
+    /// Export alerts with evidence and history
     Export {
         #[arg(long, value_enum, default_value_t = ExportFormat::Json)]
         format: ExportFormat,
+        #[command(flatten)]
+        filter: AlertFilter,
+        /// Write to this file instead of standard output
+        #[arg(long, short)]
+        output: Option<std::path::PathBuf>,
     },
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct AlertFilter {
+    #[command(flatten)]
+    pub range: TimeRange,
+    /// Minimum severity
+    #[arg(long)]
+    pub severity: Option<String>,
+    /// open, acknowledged, investigated, suppressed or closed
+    #[arg(long)]
+    pub status: Option<String>,
+    /// Rule ID, such as EXE-001
+    #[arg(long)]
+    pub rule: Option<String>,
+    /// Text contained in the affected object (file or program path)
+    #[arg(long)]
+    pub object: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]

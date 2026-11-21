@@ -175,6 +175,10 @@ pub enum Raised {
     },
     /// Below the configured minimum severity; recorded as an event only.
     BelowThreshold,
+    /// Matched an administrator's suppression; recorded as an event only.
+    Suppressed {
+        suppression: i64,
+    },
 }
 
 /// Any alert, before de-duplication and threshold checks.
@@ -199,6 +203,18 @@ pub struct AlertSpec<'a> {
 pub fn insert(conn: &Connection, a: AlertSpec<'_>, minimum: Severity) -> rusqlite::Result<Raised> {
     if a.severity < minimum {
         return Ok(Raised::BelowThreshold);
+    }
+    // A suppressed detection is kept as an event, not an alert (FR-030).
+    if let Some(suppression) = crate::lifecycle::suppressed_by(conn, a.rule_id, a.object)? {
+        record_event(
+            conn,
+            "detection",
+            "alert.suppressed",
+            a.severity,
+            None,
+            &json!({ "rule": a.rule_id, "object": a.object, "suppression": suppression }),
+        )?;
+        return Ok(Raised::Suppressed { suppression });
     }
     let fingerprint = sha256_hex(
         json!({ "object": a.object, "rule": a.rule_id, "after": a.identity })

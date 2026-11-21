@@ -329,8 +329,6 @@ fn unavailable_commands_exit_7_with_json_error() {
     let env = Env::new();
     for args in [
         vec!["scan", "--kernel"],
-        vec!["alerts", "ack", "1"],
-        vec!["alerts", "export"],
         vec!["rules", "list"],
         vec!["report", "summary"],
     ] {
@@ -461,6 +459,104 @@ fn events_and_alerts_queries() {
         vec!["events", "--since", "yesterday-ish"],
         vec!["events", "--severity", "urgent"],
         vec!["alerts", "list", "--status", "pending"],
+    ] {
+        let (code, v) = env.json(&bad);
+        assert_eq!(code, 2, "{bad:?}: {v}");
+    }
+}
+
+/// Insert an alert directly, as the daemon would.
+fn insert_alert(env: &Env, object: &str) -> i64 {
+    let c = rusqlite::Connection::open(env.db()).unwrap();
+    c.execute(
+        "INSERT INTO alerts (uuid, created_at, updated_at, severity, type, status, hostname, object, rule_id,
+                             reason, evidence, recommendation)
+         VALUES (?1, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z', 'high', 'execution', 'open', 'h',
+                 ?2, 'EXE-001', '=cmd|calc', '{\"pid\":1}', 'look')",
+        rusqlite::params![format!("u-{object}"), object],
+    )
+    .unwrap();
+    c.last_insert_rowid()
+}
+
+#[test]
+fn alert_lifecycle_suppression_and_export() {
+    let env = Env::new();
+    env.init();
+    let id = insert_alert(&env, "/tmp/x").to_string();
+    let other = insert_alert(&env, "/tmp/y").to_string();
+
+    let (code, v) = env.json(&["alerts", "ack", &id, "--note", "looking"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["from"], "open");
+    let (code, _) = env.json(&["alerts", "ack", &id]);
+    assert_eq!(code, 2, "acknowledging twice is a usage error");
+    let (code, v) = env.json(&["alerts", "note", &id, "backup job"]);
+    assert_eq!(code, 0, "{v}");
+    let (code, v) = env.json(&["alerts", "show", &id]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["status"], "acknowledged");
+    let history = v["history"].as_array().unwrap();
+    assert_eq!(history.len(), 2, "{v}");
+    assert_eq!(history[1]["note"], "backup job");
+
+    let (code, v) = env.json(&["alerts", "suppress", &id, "--reason", "build server"]);
+    assert_eq!(code, 0, "{v}");
+    let sid = v["suppression"].as_i64().unwrap().to_string();
+    let (code, v) = env.json(&["alerts", "suppressions"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v.as_array().unwrap().len(), 1, "{v}");
+    let (code, v) = env.json(&["alerts", "list", "--status", "suppressed"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["total_matching"], 1);
+    let (code, _) = env.json(&["alerts", "unsuppress", &sid]);
+    assert_eq!(code, 0);
+    let (code, _) = env.json(&["alerts", "unsuppress", &sid]);
+    assert_eq!(code, 2);
+
+    let (code, v) = env.json(&["alerts", "close", &other]);
+    assert_eq!(code, 0, "{v}");
+    let (code, v) = env.json(&["alerts", "list", "--object", "/tmp/y", "--rule", "exe-001"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["total_matching"], 1);
+    assert_eq!(v["alerts"][0]["status"], "closed");
+
+    let csv = env.dir.path().join("alerts.csv");
+    env.cmd()
+        .args(["alerts", "export", "--format", "csv", "--output"])
+        .arg(&csv)
+        .assert()
+        .success();
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::metadata(&csv).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let text = std::fs::read_to_string(&csv).unwrap();
+    assert_eq!(text.lines().count(), 3, "{text}");
+    assert!(text.contains("'=cmd|calc"), "formula guard: {text}");
+    let out = env.cmd().args(["alerts", "export"]).output().unwrap();
+    let all: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(all.as_array().unwrap().len(), 2);
+    let out = env
+        .cmd()
+        .args(["alerts", "export", "--format", "text", "--status", "closed"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&out.stdout).contains("/tmp/y"));
+
+    for bad in [
+        vec!["alerts", "ack", "999"],
+        vec!["alerts", "note", &id, "  "],
+        vec![
+            "alerts",
+            "suppress",
+            &id,
+            "--reason",
+            "x",
+            "--expires",
+            "soonish",
+        ],
     ] {
         let (code, v) = env.json(&bad);
         assert_eq!(code, 2, "{bad:?}: {v}");

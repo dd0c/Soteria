@@ -9,6 +9,7 @@
 pub mod alerts;
 pub mod exec;
 mod exec_sensor;
+pub mod lifecycle;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
