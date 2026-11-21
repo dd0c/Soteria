@@ -948,6 +948,7 @@ dependencies = [
  "soteria-integrity",
  "soteria-inventory",
  "soteria-platform",
+ "soteria-rules",
  "soteria-store",
  "tempfile",
  "toml",
@@ -968,6 +969,7 @@ dependencies = [
  "soteria-integrity",
  "soteria-inventory",
  "soteria-platform",
+ "soteria-rules",
  "soteria-sensors",
  "soteria-store",
  "tempfile",
@@ -1031,6 +1033,18 @@ dependencies = [
  "serde",
  "tempfile",
  "thiserror",
+]
+
+[[package]]
+name = "soteria-rules"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "soteria-core",
+ "tempfile",
+ "thiserror",
+ "toml",
 ]
 
 [[package]]

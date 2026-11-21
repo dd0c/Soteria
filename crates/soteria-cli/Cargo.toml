@@ -18,6 +18,7 @@ soteria-core.workspace = true
 soteria-config.workspace = true
 soteria-platform.workspace = true
 soteria-store.workspace = true
+soteria-rules.workspace = true
 soteria-inventory.workspace = true
 soteria-integrity.workspace = true
 soteria-agent.workspace = true

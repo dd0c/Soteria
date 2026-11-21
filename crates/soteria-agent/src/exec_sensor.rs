@@ -62,6 +62,7 @@ impl Agent {
                     self.config.execution.clone(),
                     self.hostname.clone(),
                     self.config.alerts.minimum_severity,
+                    Arc::clone(&self.rules),
                 );
                 self.exec = Some(ExecState {
                     rx: Some(rx),
@@ -278,6 +279,7 @@ impl Agent {
                     self.config.execution.clone(),
                     self.hostname.clone(),
                     self.config.alerts.minimum_severity,
+                    Arc::clone(&self.rules),
                 );
                 self.spare_monitor.get_or_insert(m)
             }

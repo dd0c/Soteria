@@ -34,7 +34,20 @@ pub fn run(cmd: &ConfigCommand, global: &GlobalArgs, out: &Output) -> CmdResult 
 
 fn validate(global: &GlobalArgs, out: &Output) -> CmdResult {
     let config = Config::load(&global.config).map_err(config_failure)?;
-    let issues = config.validate(ValidateOptions::default());
+    let mut issues = config.validate(ValidateOptions::default());
+    // Administrator rules are part of the configuration (FR-043).
+    if let Err(e) = soteria_rules::RuleSet::load(&config.general.rules_directory) {
+        for p in e.0 {
+            issues.insert(
+                0,
+                soteria_config::Issue {
+                    level: IssueLevel::Error,
+                    field: format!("rules {}", p.file.display()),
+                    message: p.message,
+                },
+            );
+        }
+    }
     let valid = !has_errors(&issues);
     let warnings = issues
         .iter()

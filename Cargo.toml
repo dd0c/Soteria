@@ -8,6 +8,7 @@ members = [
     "crates/soteria-inventory",
     "crates/soteria-integrity",
     "crates/soteria-sensors",
+    "crates/soteria-rules",
     "crates/soteria-agent",
     "crates/soteria-cli",
 ]
@@ -26,6 +27,7 @@ soteria-store = { path = "crates/soteria-store" }
 soteria-inventory = { path = "crates/soteria-inventory" }
 soteria-integrity = { path = "crates/soteria-integrity" }
 soteria-sensors = { path = "crates/soteria-sensors" }
+soteria-rules = { path = "crates/soteria-rules" }
 soteria-agent = { path = "crates/soteria-agent" }
 clap = { version = "4.6", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }

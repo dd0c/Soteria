@@ -10,6 +10,7 @@ pub mod alerts;
 pub mod exec;
 mod exec_sensor;
 pub mod lifecycle;
+pub mod rules;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -29,12 +30,13 @@ use soteria_integrity::compare::{Change, ChangeKind, ChangeSummary, diff_record,
 use soteria_integrity::keys;
 use soteria_integrity::scan::{self, ScanTarget, delete_file, load_file, upsert_file};
 use soteria_inventory::{Scope, inspect_path};
+use soteria_rules::RuleSet;
 use soteria_sensors::audit::{self as exec_audit, AuditSnapshot};
 use soteria_sensors::fs::{self as fs_sensor, FsEvent, SensorStats, StatsSnapshot};
 use soteria_store::{Store, now};
 use tracing::{error, info, warn};
 
-use alerts::{NewAlert, Raised, Source};
+use alerts::{NewAlert, Policy, Raised, Source};
 
 /// Meta key holding the agent's latest health snapshot (FR-039).
 pub const HEALTH_KEY: &str = "agent_health";
@@ -59,6 +61,8 @@ pub enum AgentError {
     Baseline(#[from] baseline::BaselineError),
     #[error(transparent)]
     Scan(#[from] scan::ScanError),
+    #[error(transparent)]
+    Rules(#[from] soteria_rules::RulesError),
 }
 
 pub type Result<T> = std::result::Result<T, AgentError>;
@@ -144,6 +148,8 @@ pub struct Agent {
     executions_processed: u64,
     /// Execution classifier used without a live sensor (tests).
     spare_monitor: Option<exec::ExecMonitor>,
+    /// Detection rules in effect (built-in, overrides, administrator rules).
+    rules: Arc<RuleSet>,
 }
 
 impl Agent {
@@ -154,9 +160,14 @@ impl Agent {
             include: config.paths.include.clone(),
             exclude: config.paths.exclude.clone(),
         };
+        // Invalid rules stop the agent: running without them would silently
+        // weaken detection (FR-043).
+        let rules = Arc::new(RuleSet::load(&config.general.rules_directory)?);
+        rules::sync(store.connection(), &rules)?;
         let now_i = Instant::now();
         let startup_scan = options.startup_scan && config.scanning.startup_scan;
         let mut agent = Agent {
+            rules,
             next_full: if startup_scan {
                 now_i
             } else {
@@ -538,7 +549,10 @@ impl Agent {
         if let Raised::Created { id, .. } = alerts::raise(
             self.store.connection(),
             &new,
-            self.config.alerts.minimum_severity,
+            Policy {
+                minimum: self.config.alerts.minimum_severity,
+                rules: &self.rules,
+            },
         )? && self.config.alerts.journal
         {
             let kinds: Vec<&str> = change.kinds.iter().map(|k| k.as_str()).collect();
@@ -618,40 +632,31 @@ impl Agent {
     }
 
     fn seal_alert(&mut self, version: u32, detail: &str) -> Result<()> {
-        let conn = self.store.connection();
-        let exists: Option<i64> = conn
-            .query_row(
-                "SELECT id FROM alerts WHERE rule_id = 'INT-001' AND object = ?1
-                 AND status IN ('open', 'acknowledged', 'investigated') LIMIT 1",
-                [format!("baseline v{version}")],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if exists.is_some() {
-            return Ok(());
+        let rule = soteria_rules::builtin("INT-001");
+        let raised = alerts::insert(
+            self.store.connection(),
+            alerts::AlertSpec {
+                alert_type: "baseline_integrity",
+                rule_id: rule.id,
+                severity: Severity::Critical,
+                hostname: &self.hostname,
+                object: &format!("baseline v{version}"),
+                reason: rule.description,
+                recommendation: rule.recommendation,
+                evidence: json!({ "baseline_version": version, "detail": detail }),
+                // One open alert per failed baseline, whatever the detail.
+                identity: json!(null),
+                event_id: None,
+            },
+            // A failed seal is always reported, whatever the minimum.
+            Policy {
+                minimum: Severity::Info,
+                rules: &self.rules,
+            },
+        )?;
+        if let Raised::Created { id, .. } = raised {
+            error!(alert = id, "ALERT {id} [CRITICAL] {detail}");
         }
-        let ts = now();
-        conn.execute(
-            "INSERT INTO alerts (uuid, created_at, updated_at, severity, type, status, hostname, object,
-                                 rule_id, reason, evidence, recommendation)
-             VALUES (?1, ?2, ?2, 'critical', 'baseline_integrity', 'open', ?3, ?4, 'INT-001', ?5, ?6, ?7)",
-            params![
-                soteria_store::new_id(),
-                ts,
-                self.hostname,
-                format!("baseline v{version}"),
-                "The approved baseline failed cryptographic verification.",
-                json!({ "baseline_version": version, "detail": detail }).to_string(),
-                "Treat the database as tampered with until proven otherwise. Compare with an offline copy, \
-                 check who had root access, and re-establish the baseline from a trusted state.",
-            ],
-        )?;
-        let id = conn.last_insert_rowid();
-        conn.execute(
-            "INSERT INTO alert_history (alert_id, ts, actor, action, to_status) VALUES (?1, ?2, 'soteria', 'created', 'open')",
-            params![id, ts],
-        )?;
-        error!(alert = id, "ALERT {id} [CRITICAL] {detail}");
         Ok(())
     }
 

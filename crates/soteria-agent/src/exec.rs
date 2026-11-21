@@ -18,6 +18,7 @@ use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, params};
@@ -28,10 +29,11 @@ use soteria_core::Severity;
 use soteria_integrity::baseline;
 use soteria_integrity::scan::load_file;
 use soteria_inventory::inspect_path;
+use soteria_rules::{ExecFacts, RuleSet};
 use soteria_sensors::audit::{ExecEvent, SENSOR};
 use soteria_store::Store;
 
-use crate::alerts::{self, AlertSpec, Raised};
+use crate::alerts::{self, AlertSpec, Policy, Raised};
 
 /// Shells: a service starting one of these is a classic sign of command
 /// injection or a web shell (FR-012).
@@ -167,11 +169,11 @@ impl Location {
 }
 
 struct Hit {
-    rule: &'static str,
+    rule: String,
     severity: Severity,
     object: PathBuf,
     reason: String,
-    recommendation: &'static str,
+    recommendation: String,
     identity: Value,
 }
 
@@ -198,13 +200,20 @@ pub struct ExecMonitor {
     cfg: Execution,
     hostname: String,
     minimum: Severity,
+    rules: Arc<RuleSet>,
     lineage: HashMap<u32, ProcInfo>,
     hashes: HashMap<FileKey, Option<String>>,
 }
 
 impl ExecMonitor {
-    pub fn new(cfg: Execution, hostname: String, minimum: Severity) -> ExecMonitor {
+    pub fn new(
+        cfg: Execution,
+        hostname: String,
+        minimum: Severity,
+        rules: Arc<RuleSet>,
+    ) -> ExecMonitor {
         ExecMonitor {
+            rules,
             cfg,
             hostname,
             minimum,
@@ -321,7 +330,7 @@ impl ExecMonitor {
 
         if exe_loc.deleted || exe_loc.memory_only {
             hits.push(Hit {
-                rule: "EXE-003",
+                rule: "EXE-003".into(),
                 severity: Severity::High,
                 object: exe_path.clone(),
                 reason: format!(
@@ -332,20 +341,17 @@ impl ExecMonitor {
                         "was deleted from disk after it started"
                     }
                 ),
-                recommendation: "Fileless or self-deleting programs are a common way to hide malware. Inspect the process \
-                     (/proc/PID/exe, maps, network connections) before it exits, and identify its parent.",
+                recommendation: soteria_rules::builtin("EXE-003").recommendation.into(),
                 identity: json!({ "exe": exe_path, "comm": ev.comm }),
             });
         }
         if class == Classification::KnownModified {
             hits.push(Hit {
-                rule: "EXE-002",
+                rule: "EXE-002".into(),
                 severity: Severity::High,
                 object: exe_path.clone(),
                 reason: "A program ran whose content differs from the approved baseline.".into(),
-                recommendation: "Check whether a package update or administrator replaced this file (package \
-                     manager logs, 'rpm -V' or 'dpkg --verify'). If the change is expected, re-baseline; otherwise \
-                     treat the host as compromised.",
+                recommendation: soteria_rules::builtin("EXE-002").recommendation.into(),
                 identity: identity.clone(),
             });
         }
@@ -375,13 +381,11 @@ impl ExecMonitor {
                 )
             };
             hits.push(Hit {
-                rule: "EXE-001",
+                rule: "EXE-001".into(),
                 severity: if serious { Severity::High } else { Severity::Medium },
                 object: path.clone(),
                 reason,
-                recommendation: "Location alone does not prove malice: developers and installers run programs from \
-                     home and temporary directories. Check who started it (user, parent, terminal), what it is \
-                     (hash, file type), and whether it was just downloaded.",
+                recommendation: soteria_rules::builtin("EXE-001").recommendation.into(),
                 identity: json!({ "sha256": if what == "program" { sha256.clone() } else { None }, "what": what }),
             });
         }
@@ -390,13 +394,11 @@ impl ExecMonitor {
             && is_service(parent)
         {
             hits.push(Hit {
-                rule: "EXE-004",
+                rule: "EXE-004".into(),
                 severity: Severity::High,
                 object: exe_path.clone(),
                 reason: format!("The service process '{parent}' started a shell ({child})."),
-                recommendation: "Network services rarely need a shell. This pattern is typical of command \
-                     injection or a web shell. Review the service's access logs around this time and the \
-                     shell's command line.",
+                recommendation: soteria_rules::builtin("EXE-004").recommendation.into(),
                 identity: json!({ "parent": parent, "child": child }),
             });
         }
@@ -405,18 +407,52 @@ impl ExecMonitor {
             && !script_loc.unusual()
         {
             hits.push(Hit {
-                rule: "EXE-005",
+                rule: "EXE-005".into(),
                 severity: Severity::Medium,
                 object: s.clone(),
                 reason: "An interpreter ran a script that was created or changed recently.".into(),
-                recommendation: "Confirm the script change was intended (who changed it, and why). Recently \
-                     modified scripts run by interpreters are a common persistence and execution technique.",
+                recommendation: soteria_rules::builtin("EXE-005").recommendation.into(),
                 identity: json!({ "mtime": std::fs::metadata(s).ok().map(|m| m.mtime()) }),
             });
         }
 
+        // Administrator overrides: drop disabled rules, apply fixed severities.
+        hits.retain_mut(|h| match self.rules.effective(&h.rule, h.severity) {
+            Some(s) => {
+                h.severity = s;
+                true
+            }
+            None => false,
+        });
         if !hits.is_empty() && class != Classification::KnownModified {
             class = Classification::Suspicious;
+        }
+        // Administrator execution rules see the final classification.
+        if self.rules.has_exec_rules() {
+            let facts = ExecFacts {
+                exe: exe.as_deref().map(|p| p.as_os_str().as_bytes()),
+                comm: ev.comm.as_deref(),
+                script: script.as_deref().map(|p| p.as_os_str().as_bytes()),
+                parent_exe: parent
+                    .as_ref()
+                    .and_then(|p| p.exe.as_deref())
+                    .map(|p| p.as_os_str().as_bytes()),
+                parent_comm: parent.as_ref().and_then(|p| p.comm.as_deref()),
+                uid: ev.uid,
+                euid: ev.euid,
+                classification: class.as_str(),
+                argv: &ev.argv,
+            };
+            for r in self.rules.exec_matches(&facts) {
+                hits.push(Hit {
+                    rule: r.id.clone(),
+                    severity: r.severity_for(Severity::Medium),
+                    object: script.clone().unwrap_or_else(|| exe_path.clone()),
+                    reason: r.reason.clone().unwrap_or_else(|| r.title.clone()),
+                    recommendation: r.recommendation.clone(),
+                    identity: json!({ "sha256": sha256, "exe": exe_path }),
+                });
+            }
         }
         for h in &hits {
             rationale.push(h.reason.trim_end_matches('.').to_owned());
@@ -433,7 +469,7 @@ impl ExecMonitor {
         // Store the process and its event.
         let argv = render_argv(&ev.argv, self.cfg.arguments, self.cfg.max_argument_bytes);
         let ts = ms_to_rfc3339(ev.time_ms);
-        let rules: Vec<&str> = hits.iter().map(|h| h.rule).collect();
+        let rules: Vec<&str> = hits.iter().map(|h| h.rule.as_str()).collect();
         conn.execute(
             "INSERT INTO events (ts, sensor, type, severity, path, pid, uid, data) VALUES (?1, ?2, 'process.exec', ?3, ?4, ?5, ?6, ?7)",
             params![
@@ -531,12 +567,12 @@ impl ExecMonitor {
                 conn,
                 AlertSpec {
                     alert_type: "execution",
-                    rule_id: h.rule,
+                    rule_id: &h.rule,
                     severity: h.severity,
                     hostname: &self.hostname,
                     object: &object,
                     reason: &h.reason,
-                    recommendation: h.recommendation,
+                    recommendation: &h.recommendation,
                     evidence: json!({
                         "source": "exec_event",
                         "process": process,
@@ -551,7 +587,10 @@ impl ExecMonitor {
                     identity: h.identity,
                     event_id: Some(event_id),
                 },
-                self.minimum,
+                Policy {
+                    minimum: self.minimum,
+                    rules: &self.rules,
+                },
             )?;
             if let Raised::Created { id, .. } = raised {
                 alert_ids.push(id);

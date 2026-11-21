@@ -352,6 +352,8 @@ pub enum RulesCommand {
     List,
     /// Show one rule
     Show { id: String },
+    /// Check the administrator rule files
+    Validate,
 }
 
 #[derive(Debug, Subcommand)]

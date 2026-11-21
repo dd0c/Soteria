@@ -58,6 +58,8 @@ pub struct General {
     pub log_level: String,
     pub database: PathBuf,
     pub event_retention_days: u32,
+    /// Administrator detection rules (`*.toml`).
+    pub rules_directory: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -188,6 +190,7 @@ impl Default for General {
             log_level: "info".into(),
             database: PathBuf::from(soteria_core::DEFAULT_DATABASE_PATH),
             event_retention_days: 90,
+            rules_directory: PathBuf::from("/etc/soteria/rules.d"),
         }
     }
 }
@@ -398,6 +401,7 @@ impl Config {
             );
         }
         v.absolute_path("general.database", &self.general.database);
+        v.absolute_path("general.rules_directory", &self.general.rules_directory);
         if self.general.database.as_os_str().is_empty() {
             v.error("general.database", "database path must not be empty");
         }

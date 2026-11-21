@@ -42,6 +42,10 @@ impl Env {
         let mut text = soteria_default_config()
             .replace("/var/lib/soteria/soteria.db", self.db().to_str().unwrap())
             .replace(
+                "/etc/soteria/rules.d",
+                self.dir.path().join("rules.d").to_str().unwrap(),
+            )
+            .replace(
                 "/etc/soteria/keys",
                 self.dir.path().join("keys").to_str().unwrap(),
             );
@@ -327,11 +331,7 @@ fn verify_before_init_exits_5() {
 #[test]
 fn unavailable_commands_exit_7_with_json_error() {
     let env = Env::new();
-    for args in [
-        vec!["scan", "--kernel"],
-        vec!["rules", "list"],
-        vec!["report", "summary"],
-    ] {
+    for args in [vec!["scan", "--kernel"], vec!["report", "summary"]] {
         let (code, v) = env.json(&args);
         assert_eq!(code, 7, "{args:?}");
         assert_eq!(v["kind"], "unavailable");
@@ -561,6 +561,63 @@ fn alert_lifecycle_suppression_and_export() {
         let (code, v) = env.json(&bad);
         assert_eq!(code, 2, "{bad:?}: {v}");
     }
+}
+
+#[test]
+fn rules_list_show_and_validate() {
+    let env = Env::new();
+    env.init();
+    let (code, v) = env.json(&["rules", "list"]);
+    assert_eq!(code, 0, "{v}");
+    let ids: Vec<&str> = v["rules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_str().unwrap())
+        .collect();
+    assert!(
+        ids.contains(&"FIM-003") && ids.contains(&"EXE-004") && ids.contains(&"INT-001"),
+        "{ids:?}"
+    );
+    env.cmd()
+        .args(["rules", "show", "exe-001"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("unusual location"));
+    let (code, _) = env.json(&["rules", "show", "NOPE-1"]);
+    assert_eq!(code, 2);
+
+    let dir = env.dir.path().join("rules.d");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("site.toml"),
+        "[[override]]\nrule = \"FIM-011\"\nenabled = false\n\n\
+         [[rule]]\nid = \"SITE-1\"\ntitle = \"Sudoers changed\"\non = \"file\"\nseverity = \"critical\"\n\
+         paths = [\"/etc/sudoers\", \"/etc/sudoers.d/*\"]\n",
+    )
+    .unwrap();
+    let (code, v) = env.json(&["rules", "validate"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["admin_rules"], 1);
+    assert_eq!(v["overrides"], 1);
+    let (_, v) = env.json(&["rules", "show", "SITE-1"]);
+    assert_eq!(v["severity"], "critical");
+    assert_eq!(v["matcher"]["on"], "file");
+    let (_, v) = env.json(&["rules", "show", "FIM-011"]);
+    assert_eq!(v["enabled"], false);
+
+    std::fs::write(dir.join("zz-bad.toml"), "[[rule]]\nid = \"SITE-1\"\n").unwrap();
+    let (code, v) = env.json(&["rules", "validate"]);
+    assert_eq!(code, 3, "{v}");
+    let (code, v) = env.json(&["config", "validate"]);
+    assert_eq!(code, 3, "{v}");
+    assert!(
+        v["issues"][0]["field"]
+            .as_str()
+            .unwrap()
+            .contains("zz-bad.toml"),
+        "{v}"
+    );
 }
 
 #[test]

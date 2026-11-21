@@ -38,6 +38,7 @@ fn fixture() -> Fixture {
     config.baseline.signing_key = sk.clone();
     config.baseline.public_key = pk;
     config.alerts.journal = false;
+    config.general.rules_directory = dir.path().join("rules.d");
     // The fixture lives under /tmp; tests that need unusual locations set them.
     config.execution.unusual_paths = vec![];
 
@@ -274,6 +275,7 @@ fn without_baseline_changes_are_recorded_but_not_alerted() {
     fs::write(root.join("f"), "1").unwrap();
     let mut config = Config::default();
     config.general.database = dir.path().join("db");
+    config.general.rules_directory = dir.path().join("rules.d");
     config.paths.include = vec![root.clone()];
     config.paths.exclude = vec![];
     let (store, _) = Store::create_or_migrate(&config.general.database).unwrap();
@@ -495,6 +497,7 @@ fn without_baseline_executions_are_unverified() {
     let dir = tempdir();
     let mut config = Config::default();
     config.general.database = dir.path().join("db");
+    config.general.rules_directory = dir.path().join("rules.d");
     config.paths.include = vec![dir.path().to_owned()];
     config.execution.unusual_paths = vec![];
     let (store, _) = Store::create_or_migrate(&config.general.database).unwrap();
@@ -516,6 +519,106 @@ fn without_baseline_executions_are_unverified() {
         "{limitations}"
     );
     agent.shutdown();
+}
+
+#[test]
+fn rule_overrides_and_administrator_rules_apply() {
+    let f = fixture();
+    let rules_dir = &f.config.general.rules_directory;
+    fs::create_dir_all(rules_dir).unwrap();
+    fs::write(
+        rules_dir.join("local.toml"),
+        format!(
+            r#"
+[[override]]
+rule = "FIM-003"
+severity = "critical"
+
+[[override]]
+rule = "FIM-002"
+enabled = false
+
+[[rule]]
+id = "LOCAL-001"
+title = "Application configuration changed"
+on = "file"
+severity = "high"
+paths = ["{root}/etc/**"]
+changes = ["content_modified"]
+recommendation = "Ask the application team."
+
+[[rule]]
+id = "LOCAL-002"
+title = "Listing with a secret flag"
+on = "execution"
+severity = "low"
+programs = ["ls"]
+arguments = ["--secret-flag"]
+"#,
+            root = f.root.display()
+        ),
+    )
+    .unwrap();
+    let mut agent = start(&f, quiet());
+
+    let conf = f.root.join("etc/app.conf");
+    fs::write(&conf, "a = 2\n").unwrap();
+    agent.verify_path(&conf, Source::FsEvent).unwrap();
+    let tool = f.root.join("bin/tool");
+    fs::remove_file(&tool).unwrap();
+    agent.verify_path(&tool, Source::FsEvent).unwrap();
+    let a = alerts(&agent);
+    let conf_s = conf.display().to_string();
+    assert_eq!(
+        a,
+        vec![
+            ("FIM-003".into(), conf_s.clone(), "critical".into()),
+            ("LOCAL-001".into(), conf_s, "high".into()),
+        ],
+        "FIM-002 is disabled"
+    );
+
+    let ls = ["/bin/ls", "/usr/bin/ls"]
+        .into_iter()
+        .map(Path::new)
+        .find(|p| p.exists())
+        .unwrap();
+    agent
+        .handle_exec(&exec_event(60, 1, ls, &["ls", "-l"]))
+        .unwrap();
+    assert!(!rules(&agent).contains(&"LOCAL-002".to_owned()));
+    agent
+        .handle_exec(&exec_event(61, 1, ls, &["ls", "--secret-flag"]))
+        .unwrap();
+    assert!(
+        rules(&agent).contains(&"LOCAL-002".to_owned()),
+        "{:?}",
+        rules(&agent)
+    );
+
+    let (version, source): (i64, String) = agent
+        .store()
+        .connection()
+        .query_row(
+            "SELECT version, source FROM rules WHERE id = 'LOCAL-001'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((version, source.as_str()), (1, "admin"));
+    agent.shutdown();
+
+    // Invalid rules stop the agent instead of running without them.
+    fs::write(
+        rules_dir.join("bad.toml"),
+        "[[override]]\nrule = \"NOPE\"\nenabled = false\n",
+    )
+    .unwrap();
+    let (store, _) = Store::create_or_migrate(&f.db).unwrap();
+    let err = Agent::start(f.config.clone(), store, quiet())
+        .err()
+        .unwrap();
+    assert!(err.to_string().contains("unknown rule 'NOPE'"), "{err}");
 }
 
 /// tempfile's default names start with a dot, which counts as a hidden path.

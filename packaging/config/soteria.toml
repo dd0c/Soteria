@@ -12,7 +12,12 @@ version = 1
 # One of: error, warn, info, debug, trace
 log_level = "info"
 database = "/var/lib/soteria/soteria.db"
+# Events and execution records older than this are deleted. Alerts, their
+# history and baselines are kept.
 event_retention_days = 90
+# Administrator detection rules and overrides: *.toml files, see
+# 'soteria rules' and docs/RULES.md.
+rules_directory = "/etc/soteria/rules.d"
 
 [monitoring]
 execution = true

@@ -77,8 +77,13 @@ pub fn run(global: &GlobalArgs) -> CmdResult {
     // Starting the agent verifies the approved baseline's seal (FR-032):
     // a failed seal raises a critical alert but does not stop the agent,
     // which must keep reporting.
-    let mut agent = Agent::start(config, store, Options::default())
-        .map_err(|e| Failure::new(ExitStatus::Internal, format!("cannot start agent: {e}")))?;
+    let mut agent = Agent::start(config, store, Options::default()).map_err(|e| match e {
+        soteria_agent::AgentError::Rules(e) => {
+            Failure::new(ExitStatus::ConfigInvalid, e.to_string())
+                .hint("check them with 'soteria rules validate'")
+        }
+        e => Failure::new(ExitStatus::Internal, format!("cannot start agent: {e}")),
+    })?;
 
     record(
         agent.store(),
