@@ -6,14 +6,17 @@ system (HIDS) for RHEL 9, RHEL 10 and Debian 13, written in Rust. It keeps an
 administrator-approved, signed baseline of system state, watches file changes
 and program execution, and reports deviations and monitoring gaps locally.
 
+- Website and installation guide: https://soteria.akuadora.net (source in [site/](site/))
+- Administration guide: [docs/ADMIN.md](docs/ADMIN.md)
 - Requirements: [SOTERIA_SRS_v1.0.md](SOTERIA_SRS_v1.0.md)
 - Implementation plan and milestones: [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md)
 - CLI reference and exit codes: [docs/CLI.md](docs/CLI.md)
 - Detection rules and rule files: [docs/RULES.md](docs/RULES.md)
+- Benchmarks: [docs/BENCHMARKS.md](docs/BENCHMARKS.md)
 
 ## Status
 
-Milestones 1 to 5 are in place: CLI, configuration validation, platform
+All seven milestones are in place: CLI, configuration validation, platform
 detection, SQLite storage, the daemon and systemd unit, file inventory
 (classification, metadata, SHA-256), signed baselines and baseline
 comparison, live file integrity monitoring with scheduled reconciliation,
@@ -22,7 +25,12 @@ unusual locations, lineage, search), and detection handling: configurable
 rules, alert lifecycle and suppression, incidents, retention, exports,
 reports, and email and webhook notifications, persistence, account,
 kernel and boot monitoring, self-integrity, and SELinux and AppArmor
-confinement (`packaging/selinux`, `packaging/apparmor`).
+confinement (`packaging/selinux`, `packaging/apparmor`). Releases ship RPM
+packages for RHEL 9 and 10 and a DEB package for Debian 13
+(`packaging/rpm`, `packaging/deb`), tested for install, upgrade and removal
+in CI.
+
+To install on a server, follow [docs/ADMIN.md](docs/ADMIN.md).
 
 Execution monitoring needs auditd and the rules file
 `packaging/audit/soteria.rules` (see [docs/CLI.md](docs/CLI.md#execution-monitoring)).
@@ -73,6 +81,10 @@ sudo -E soteria scan --kernel     # kernel, boot parameters, Secure Boot, module
 | `packaging/audit/soteria.rules` | auditd rule that reports program executions |
 | `packaging/selinux/` | SELinux policy module (`make -f /usr/share/selinux/devel/Makefile soteria.pp && semodule -i soteria.pp && restorecon -R /usr/bin/soteria /etc/soteria /var/lib/soteria`) |
 | `packaging/apparmor/usr.bin.soteria` | AppArmor profile (`apparmor_parser -r`) |
+| `packaging/rpm/`, `packaging/deb/` | RPM spec and DEB build script (`build.sh <binary> <outdir>`) |
+| `packaging/sysusers/soteria.conf` | The `soteria` system account |
+| `packaging/test/install-test.sh` | Install, upgrade and removal test, run in disposable containers |
+| `site/` | Static website for soteria.akuadora.net |
 
 ## Security limitations
 

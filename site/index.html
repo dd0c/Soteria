@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Soteria</title>
+<meta name="description" content="Soteria: host-based intrusion detection and integrity monitoring for Linux servers, written in Rust.">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <nav>
+    <a href="./" aria-current="page">Soteria</a>
+    <a href="install.html">Install</a>
+    <a href="https://github.com/dd0c/Soteria/releases/latest">Download</a>
+    <a href="https://github.com/dd0c/Soteria">Source</a>
+  </nav>
+  <h1>Soteria</h1>
+  <p class="lede">Host-based intrusion detection and integrity monitoring for
+  Linux servers. Soteria keeps an approved, signed record of how a host
+  should look, watches it as it changes, and tells you what deviates and
+  where it cannot see.</p>
+  <p>
+    <a class="button" href="install.html">Install guide</a>
+    <a class="button secondary" href="https://github.com/dd0c/Soteria/releases/latest">Download packages</a>
+  </p>
+</header>
+<main>
+  <h2>What it watches</h2>
+  <ul class="features">
+    <li><strong>Files</strong>System binaries, libraries, <code>/etc</code>, <code>/boot</code> and your own paths, with SHA-256, ownership, mode and capabilities, checked live through inotify and by scheduled scans.</li>
+    <li><strong>Program execution</strong>Every execution from the kernel audit stream: unknown or modified programs, unusual locations, suspicious lineage and privilege changes.</li>
+    <li><strong>Persistence</strong>SSH keys, shell startup files, systemd units, user services and cron, the places an intruder comes back through.</li>
+    <li><strong>Accounts</strong>New, removed or changed users and groups, extra UID 0 accounts, privileged groups, sudo rules and empty passwords.</li>
+    <li><strong>Kernel and boot</strong>Kernel version, boot parameters, Secure Boot state, and unknown, unsigned or out-of-tree modules.</li>
+    <li><strong>Itself</strong>Changes to its own configuration, rules and keys, unclean stops and every gap in its coverage are reported, never hidden.</li>
+  </ul>
+
+  <h2>How it works</h2>
+  <p>After installation you inventory the host and approve the result. The
+  baseline is signed with an Ed25519 key that only root holds; the daemon
+  runs as an unprivileged <code>soteria</code> user with two read-only
+  capabilities, so it can detect change but cannot approve it.
+  Baselines are never updated automatically: after planned maintenance you
+  review the differences and approve a new one.</p>
+  <p>Every alert names the rule that fired, the approved and current state,
+  and what to check next. Alerts stay on the host in a local database and
+  can be forwarded by email or webhook as they happen.</p>
+
+  <h2>Supported systems</h2>
+  <table>
+    <tr><th>Distribution</th><th>Package</th><th>Confinement</th></tr>
+    <tr><td>RHEL 9, RHEL 10 (and rebuilds)</td><td>RPM</td><td>SELinux module</td></tr>
+    <tr><td>Debian 13</td><td>DEB</td><td>AppArmor profile</td></tr>
+  </table>
+  <p>x86_64. Other systemd distributions work but are not officially
+  supported.</p>
+
+  <h2>Footprint</h2>
+  <p>On a 4 vCPU virtual machine: 0.1&nbsp;% CPU when idle, 12&nbsp;MiB of
+  memory, a full scan of 50,000 files in under two seconds, and an alert
+  about 0.3&nbsp;seconds after a file changes. Details in the
+  <a href="https://github.com/dd0c/Soteria/blob/main/docs/BENCHMARKS.md">benchmarks</a>.</p>
+
+  <h2>Documentation</h2>
+  <ul>
+    <li><a href="install.html">Installation guide</a></li>
+    <li><a href="https://github.com/dd0c/Soteria/blob/main/docs/ADMIN.md">Administration guide</a></li>
+    <li><a href="https://github.com/dd0c/Soteria/blob/main/docs/CLI.md">Command reference</a></li>
+    <li><a href="https://github.com/dd0c/Soteria/blob/main/docs/RULES.md">Detection rules</a></li>
+  </ul>
+</main>
+<footer>
+  Soteria is free software under the GNU GPL v3. Named after the Greek
+  goddess of safety and preservation from harm.
+</footer>
+</body>
+</html>

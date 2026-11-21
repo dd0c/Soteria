@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Install Soteria</title>
+<meta name="description" content="Step-by-step installation of Soteria on RHEL 9, RHEL 10 and Debian 13.">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <nav>
+    <a href="./">Soteria</a>
+    <a href="install.html" aria-current="page">Install</a>
+    <a href="https://github.com/dd0c/Soteria/releases/latest">Download</a>
+    <a href="https://github.com/dd0c/Soteria">Source</a>
+  </nav>
+  <h1>Installation guide</h1>
+  <p class="lede">From a fresh RHEL 9, RHEL 10 or Debian 13 server to active
+  monitoring in about ten minutes.</p>
+</header>
+<main>
+  <h2>1. Before you install</h2>
+  <ul>
+    <li><strong>A trusted starting point.</strong> The first baseline records
+    the host as it is when you approve it. Install on a freshly built or
+    verified host, not on one you suspect.</li>
+    <li><strong>auditd</strong> reports program executions. It is installed
+    by default on RHEL. On Debian: <code>sudo apt install auditd</code>.
+    Without it everything except execution monitoring works.</li>
+    <li><strong>Disk:</strong> about 600 bytes per monitored file (15 MB for
+    25,000 files) plus events for the retention period, 90 days by
+    default.</li>
+    <li>Root access (<code>sudo</code>) and an x86_64 system with systemd.</li>
+  </ul>
+
+  <h2>2. Download and check the packages</h2>
+  <p>Download the packages for your distribution and
+  <code>SHA256SUMS</code> from the
+  <a href="https://github.com/dd0c/Soteria/releases/latest">latest release</a>,
+  then check them:</p>
+<pre><code>sha256sum --check --ignore-missing SHA256SUMS</code></pre>
+  <p>Every listed file you downloaded must report <code>OK</code>. Do not
+  install a package that fails the check.</p>
+
+  <h2>3. Install the package</h2>
+  <h3>RHEL 9</h3>
+<pre><code>sudo dnf install ./soteria-&lt;version&gt;-1.el9.x86_64.rpm \
+                 ./soteria-selinux-&lt;version&gt;-1.el9.noarch.rpm</code></pre>
+  <h3>RHEL 10</h3>
+<pre><code>sudo dnf install ./soteria-&lt;version&gt;-1.el10.x86_64.rpm \
+                 ./soteria-selinux-&lt;version&gt;-1.el10.noarch.rpm</code></pre>
+  <p><code>soteria-selinux</code> confines the daemon with an SELinux
+  policy. Install it whenever SELinux is enabled (the default).</p>
+  <h3>Debian 13</h3>
+<pre><code>sudo apt install ./soteria_&lt;version&gt;_amd64.deb</code></pre>
+  <p>The AppArmor profile is loaded automatically when AppArmor is
+  enabled.</p>
+
+  <h3>What the package does</h3>
+  <ul>
+    <li>creates the system account <code>soteria</code>, without a login shell;</li>
+    <li>installs <code>/usr/bin/soteria</code>, the <code>soteria.service</code>
+    unit, the configuration <code>/etc/soteria/soteria.toml</code>, the audit
+    rule <code>/etc/audit/rules.d/soteria.rules</code> and the SELinux or
+    AppArmor policy;</li>
+    <li>creates <code>/var/lib/soteria</code> and <code>/var/log/soteria</code>;</li>
+    <li>loads the audit rule if auditd is running.</li>
+  </ul>
+  <p class="note">The package does not start monitoring. Initialization is a
+  deliberate step, so that you approve what is recorded.</p>
+  <p>If you install auditd after Soteria, load the rule with
+  <code>sudo augenrules --load</code>.</p>
+
+  <h2>4. Review the configuration (optional)</h2>
+  <p>The defaults monitor system binaries and libraries, <code>/etc</code>,
+  <code>/boot</code>, persistence locations (SSH keys, shell startup files,
+  systemd units, cron) and Soteria's own files. Common changes in
+  <code>/etc/soteria/soteria.toml</code>:</p>
+  <table>
+    <tr><th>Setting</th><th>Purpose</th></tr>
+    <tr><td><code>[paths] include</code>, <code>exclude</code></td><td>Add application directories such as <code>/opt/app</code>, leave out noisy ones</td></tr>
+    <tr><td><code>[execution] unusual_paths</code></td><td>Where running a program is suspicious (<code>/tmp</code>, <code>/dev/shm</code>, ...)</td></tr>
+    <tr><td><code>[alerts]</code></td><td>Minimum severity, email and webhook delivery</td></tr>
+    <tr><td><code>[general] event_retention_days</code></td><td>How long events are kept</td></tr>
+  </table>
+  <p>Check every change:</p>
+<pre><code>sudo soteria config validate</code></pre>
+  <p>Invalid configuration stops the service rather than letting it run with
+  weaker defaults.</p>
+
+  <h2>5. Initialize and approve the baseline</h2>
+<pre><code>sudo soteria init</code></pre>
+  <p><code>init</code> checks prerequisites, creates the database and the
+  baseline signing key (<code>/etc/soteria/keys/baseline.key</code>,
+  readable by root only), inventories the host (10 to 60 seconds on a
+  typical server) and shows the draft baseline: objects by kind and any
+  coverage gaps.</p>
+  <p>Review it and answer <code>y</code> to approve. Approval signs the
+  baseline with the root-held key. The daemon only has the public key, so it
+  cannot forge an approval.</p>
+  <p>To review and approve later, for example in automation:</p>
+<pre><code>sudo soteria init --non-interactive    # leaves draft 1
+sudo soteria baseline review 1
+sudo soteria baseline approve 1</code></pre>
+
+  <h2>6. Start monitoring</h2>
+<pre><code>sudo systemctl enable --now soteria
+soteria status
+sudo soteria verify</code></pre>
+  <p><code>status</code> should show <code>Protection: ACTIVE</code>.
+  Anything else is explained by the sensor list and by
+  <code>soteria verify</code>, which names every coverage gap, such as an
+  unloaded audit rule or paths the daemon cannot read.</p>
+
+  <h2>7. Check that it works</h2>
+  <p>Create a harmless file in a monitored directory, then look for the alert
+  a few seconds later:</p>
+<pre><code>sudo touch /etc/soteria-test
+soteria alerts list
+soteria alerts show &lt;id&gt;</code></pre>
+  <p>Remove the file, close the alert with a note, and confirm nothing else
+  deviates from the baseline:</p>
+<pre><code>sudo rm /etc/soteria-test
+sudo soteria alerts close &lt;id&gt; --note "installation test"
+sudo soteria scan --baseline</code></pre>
+
+  <h2>8. Forward alerts (recommended)</h2>
+  <p>An attacker with full root access can tamper with anything stored on the
+  host. Forward alerts by email or webhook so they leave the host as they
+  happen: configure <code>[alerts]</code> as described in the
+  <a href="https://github.com/dd0c/Soteria/blob/main/docs/CLI.md#notifications">command reference</a>,
+  validate, and restart the service:</p>
+<pre><code>sudo soteria config validate
+sudo systemctl restart soteria</code></pre>
+  <p>Changes to Soteria's own configuration raise a critical
+  <code>SELF-001</code> alert by design. Once you have confirmed the change,
+  approve a new baseline (next step).</p>
+
+  <h2>9. After maintenance: approve changes</h2>
+  <p>Baselines are never updated automatically. After package updates or
+  configuration changes:</p>
+<pre><code>sudo soteria scan --baseline              # what differs from the approved baseline
+sudo soteria baseline create              # draft from the current state
+sudo soteria baseline diff &lt;approved&gt; &lt;draft&gt;
+sudo soteria baseline approve &lt;draft&gt;</code></pre>
+
+  <h2>10. Upgrade</h2>
+  <p>Install the newer package the same way as in step 3. Your configuration
+  and rules are kept and a running daemon is restarted. If the database
+  format changes, the daemon first copies the database to
+  <code>/var/lib/soteria/soteria.db.schema-&lt;N&gt;.bak</code>.</p>
+  <p>To go back: stop the service, install the previous package, and restore
+  the copy:</p>
+<pre><code>sudo systemctl stop soteria
+sudo cp /var/lib/soteria/soteria.db.schema-&lt;N&gt;.bak /var/lib/soteria/soteria.db
+sudo chown soteria:soteria /var/lib/soteria/soteria.db
+sudo systemctl start soteria</code></pre>
+
+  <h2>11. Remove</h2>
+<pre><code>sudo dnf remove soteria soteria-selinux    # RHEL
+sudo apt remove soteria                    # Debian</code></pre>
+  <p>Removal stops the service and removes the program, but keeps the
+  database, baselines, keys, rules and logs. To delete them deliberately:</p>
+<pre><code>sudo rm -rf /var/lib/soteria /etc/soteria /var/log/soteria
+sudo userdel soteria
+sudo rm /etc/audit/rules.d/soteria.rules &amp;&amp; sudo augenrules --load</code></pre>
+
+  <h2>Troubleshooting</h2>
+  <table>
+    <tr><th>Symptom</th><th>Check</th></tr>
+    <tr><td>Service fails with exit code 3</td><td><code>sudo soteria config validate</code></td></tr>
+    <tr><td>Service fails with exit code 5</td><td><code>sudo soteria init</code> was not run</td></tr>
+    <tr><td>Execution sensor unavailable</td><td>Is auditd running? <code>sudo augenrules --load</code></td></tr>
+    <tr><td>Kernel sensor degraded</td><td><code>/proc/modules</code> unreadable (containers)</td></tr>
+    <tr><td><code>inotify watch limit reached</code></td><td>Raise <code>fs.inotify.max_user_watches</code> with sysctl</td></tr>
+    <tr><td>SELinux denials</td><td><code>sudo ausearch -m avc -c soteria</code>, then report them</td></tr>
+  </table>
+  <p>Logs: <code>journalctl -u soteria</code>. Full details are in the
+  <a href="https://github.com/dd0c/Soteria/blob/main/docs/ADMIN.md">administration guide</a>.</p>
+</main>
+<footer>
+  Soteria is free software under the GNU GPL v3.
+  <a href="https://github.com/dd0c/Soteria/issues">Report a problem</a>.
+</footer>
+</body>
+</html>

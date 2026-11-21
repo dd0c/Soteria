@@ -1,0 +1,84 @@
+name: Packages
+
+# Build the RPMs and the DEB on each supported release, then install,
+# initialize, run, upgrade and remove them in a fresh container
+# (SRS 11, 12.5, 13). A tag v* also publishes them as a GitHub release.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: package (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # AlmaLinux is binary compatible with RHEL and, unlike UBI, ships
+          # selinux-policy-devel and rpm-build in its default repositories.
+          - name: el9
+            image: almalinux:9
+            deps: dnf install -y gcc git make rpm-build systemd-rpm-macros selinux-policy-devel util-linux shadow-utils bzip2 policycoreutils
+            build: packaging/rpm/build.sh
+          - name: el10
+            image: almalinux:10
+            deps: dnf install -y gcc git make rpm-build systemd-rpm-macros selinux-policy-devel util-linux shadow-utils bzip2 policycoreutils
+            build: packaging/rpm/build.sh
+          - name: debian13
+            image: debian:trixie
+            deps: apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev curl ca-certificates git dpkg-dev util-linux systemd
+            build: packaging/deb/build.sh
+    container:
+      image: ${{ matrix.image }}
+      # The daemon's two capabilities, which Docker leaves out by default.
+      options: --cap-add DAC_READ_SEARCH --cap-add AUDIT_READ
+    steps:
+      - name: Install build dependencies
+        run: ${{ matrix.deps }}
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build the release binary
+        run: cargo build --release --locked
+      - name: Build packages
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          ${{ matrix.build }} target/release/soteria out
+          # A second build with a higher version, to test upgrades.
+          sed -i 's/^version = "\([0-9]*\)\.\([0-9]*\)\.[0-9]*"/version = "\1.\2.99"/' Cargo.toml
+          ${{ matrix.build }} target/release/soteria upgrade
+          git checkout Cargo.toml
+          ls -l out upgrade
+      - name: Install, run, upgrade and remove
+        run: |
+          set -- $(ls out/*.rpm out/*.deb 2>/dev/null | sed 's#^#./#')
+          up=$(ls upgrade/*.rpm upgrade/*.deb 2>/dev/null | sed 's#^#./#')
+          packaging/test/install-test.sh "$@" -- $up
+      - uses: actions/upload-artifact@v4
+        with:
+          name: soteria-${{ matrix.name }}
+          path: out/
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "Soteria $GITHUB_REF_NAME" --generate-notes

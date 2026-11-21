@@ -1,0 +1,50 @@
+#!/bin/sh
+# Soteria post-installation (SRS 11.1, 11.3).
+set -e
+
+case "$1" in
+configure)
+	systemd-sysusers /usr/lib/sysusers.d/soteria.conf
+
+	# Baseline keys: root only; the public key is made readable by init.
+	install -d -m 0755 -o root -g root /etc/soteria /etc/soteria/rules.d
+	install -d -m 0750 -o root -g soteria /etc/soteria/keys
+	install -d -m 0750 -o soteria -g soteria /var/lib/soteria /var/log/soteria
+	# The daemon reads its configuration through its group; others cannot.
+	chgrp soteria /etc/soteria/soteria.toml
+	chmod 0640 /etc/soteria/soteria.toml
+
+	if [ -d /run/systemd/system ]; then
+		systemctl daemon-reload >/dev/null || true
+	fi
+
+	# Confine the daemon where AppArmor is active.
+	if [ -x /usr/sbin/apparmor_parser ] && aa-enabled --quiet 2>/dev/null; then
+		apparmor_parser -r -T -W /etc/apparmor.d/usr.bin.soteria || \
+			echo "soteria: could not load the AppArmor profile; see 'soteria verify'" >&2
+	fi
+
+	# Execution monitoring needs the audit rule loaded by auditd.
+	if [ -x /usr/sbin/augenrules ] && systemctl is-active --quiet auditd 2>/dev/null; then
+		augenrules --load >/dev/null 2>&1 || \
+			echo "soteria: could not load the audit rule; run 'augenrules --load'" >&2
+	fi
+
+	if [ -z "$2" ]; then
+		# First installation: initialization stays explicit (SRS 11.2).
+		cat <<'MSG'
+
+Soteria is installed but not monitoring yet. Next:
+  sudo soteria init                 # inventory the host and approve a baseline
+  sudo systemctl enable --now soteria
+Execution monitoring needs auditd (apt install auditd).
+MSG
+	elif [ -d /run/systemd/system ]; then
+		# Upgrade: a running daemon restarts and migrates its database,
+		# keeping a copy of the old one.
+		systemctl try-restart soteria.service >/dev/null || true
+	fi
+	;;
+esac
+
+exit 0

@@ -1,0 +1,15 @@
+Package: soteria
+Version: @VERSION@
+Architecture: @ARCH@
+Maintainer: Soteria maintainers <noreply@akuadora.net>
+Installed-Size: @SIZE@
+Depends: libc6 (>= 2.36), systemd
+Recommends: auditd
+Suggests: apparmor
+Section: admin
+Priority: optional
+Homepage: https://github.com/dd0c/Soteria
+Description: host intrusion detection and integrity monitoring
+ Soteria inventories a host, seals an approved baseline, and watches files,
+ program executions, persistence locations, accounts, the kernel and boot
+ configuration for deviations, with alerts, incidents and reports.
