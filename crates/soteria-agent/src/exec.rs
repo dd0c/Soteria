@@ -354,7 +354,9 @@ impl ExecMonitor {
             (script.as_ref(), &script_loc, "script"),
         ] {
             let Some(path) = path else { continue };
-            let new_unknown = loc.recently_changed && class != Classification::Trusted;
+            // "New" needs a checked verdict: an unverified program (no baseline,
+            // not hashable) is not known to be unknown.
+            let new_unknown = loc.recently_changed && class == Classification::Unknown;
             if !loc.unusual() && !(new_unknown && what == "program") {
                 continue;
             }
