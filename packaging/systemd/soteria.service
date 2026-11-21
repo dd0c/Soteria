@@ -1,0 +1,72 @@
+# Soteria host intrusion detection and integrity monitoring (SRS 8.3).
+#
+# Hardening note: every setting below was chosen so it does not hide parts of
+# the filesystem Soteria must monitor. In particular PrivateTmp, ProtectHome
+# and ProtectKernelModules are deliberately NOT enabled: they would hide /tmp,
+# shell startup files and SSH keys in home directories, and kernel modules
+# from the sensors. Anything a sensor cannot reach is reported as a coverage
+# gap by `soteria status` and `soteria verify`.
+
+[Unit]
+Description=Soteria host intrusion detection and integrity monitoring
+Documentation=https://github.com/dd0c/Soteria
+After=local-fs.target
+Wants=local-fs.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/bin/soteria daemon
+Restart=on-failure
+RestartSec=5s
+# The daemon validates its configuration before starting. Invalid
+# configuration (3) and a missing database (5) need an administrator;
+# restarting in a loop would not help, and the unit stays visibly failed.
+RestartPreventExitStatus=3 5
+WatchdogSec=60s
+TimeoutStopSec=30s
+
+User=soteria
+Group=soteria
+StateDirectory=soteria
+StateDirectoryMode=0750
+RuntimeDirectory=soteria
+RuntimeDirectoryMode=0750
+LogsDirectory=soteria
+LogsDirectoryMode=0750
+UMask=0077
+
+# Read access to root-only files for hashing, and to the kernel audit
+# multicast stream for execution events. Nothing else.
+AmbientCapabilities=CAP_DAC_READ_SEARCH CAP_AUDIT_READ
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_AUDIT_READ
+NoNewPrivileges=yes
+SecureBits=keep-caps
+
+ProtectSystem=strict
+ReadWritePaths=/var/lib/soteria /run/soteria /var/log/soteria
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectProc=default
+PrivateDevices=yes
+PrivateNetwork=no
+# AF_INET/AF_INET6 are added when webhook/email notifications land (M5).
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @swap @reboot @raw-io @module @debug @cpu-emulation @obsolete
+MemoryMax=300M
+CPUWeight=50
+IOWeight=50
+Nice=10
+
+[Install]
+WantedBy=multi-user.target
