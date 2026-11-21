@@ -58,6 +58,16 @@ jobs:
           chmod -R a+rX "$HOME/.rustup" "$HOME/.cargo/bin"
           su tester -c "PATH=$HOME/.cargo/bin:/usr/bin:/bin RUSTUP_HOME=$HOME/.rustup CARGO_HOME=/home/tester/.cargo CARGO_TARGET_DIR=/home/tester/target cargo test --workspace --locked"
 
+  # Benchmark (docs/BENCHMARKS.md) at a smaller size, so a regression in
+  # scan speed, alert latency or memory shows up in the job summary.
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run
+        run: cargo run --release --locked -p soteria-agent --example bench -- 20000 500 5000 | tee -a "$GITHUB_STEP_SUMMARY"
+
   # The SELinux module is built against Fedora's policy (the closest to
   # RHEL's that a container offers); the AppArmor profile is parsed.
   selinux:

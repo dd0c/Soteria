@@ -485,14 +485,41 @@ impl Agent {
     /// Verify every pending path now, regardless of settle time.
     pub fn flush(&mut self) -> Result<()> {
         let paths: Vec<PathBuf> = self.pending.drain().map(|(p, _)| p).collect();
-        for p in paths {
-            self.verify_path(&p, Source::FsEvent)?;
-            self.note_account_source(&p);
-        }
+        self.verify_batch(paths)?;
         if self.accounts_due {
             self.check_accounts()?;
         }
         Ok(())
+    }
+
+    /// Verify settled paths in one transaction, so a burst of changes costs
+    /// one commit instead of several per path (NFR-004).
+    fn verify_batch(&mut self, paths: Vec<PathBuf>) -> Result<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let batched = paths.len() > 1;
+        if batched {
+            self.store.connection().execute_batch("BEGIN IMMEDIATE")?;
+        }
+        let mut result = Ok(());
+        for p in &paths {
+            if let Err(e) = self.verify_path(p, Source::FsEvent) {
+                result = Err(e);
+                break;
+            }
+            self.note_account_source(p);
+        }
+        if batched {
+            let conn = self.store.connection();
+            match result {
+                Ok(()) => conn.execute_batch("COMMIT")?,
+                Err(_) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                }
+            }
+        }
+        result
     }
 
     fn note_account_source(&mut self, path: &Path) {
@@ -510,11 +537,10 @@ impl Agent {
             .filter(|(_, p)| now_i - p.last >= settle || now_i - p.first >= max_delay)
             .map(|(path, _)| path.clone())
             .collect();
-        for path in due {
-            self.pending.remove(&path);
-            self.verify_path(&path, Source::FsEvent)?;
-            self.note_account_source(&path);
+        for path in &due {
+            self.pending.remove(path);
         }
+        self.verify_batch(due)?;
         if self.accounts_due {
             self.check_accounts()?;
         }
