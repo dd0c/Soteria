@@ -290,6 +290,31 @@ impl Store {
         Ok(())
     }
 
+    /// The latest recorded state of each sensor (FR-039).
+    pub fn sensor_states(&self) -> Result<Vec<SensorState>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT h.sensor, h.state, h.ts, h.detail FROM sensor_health h
+             WHERE h.id = (SELECT MAX(id) FROM sensor_health WHERE sensor = h.sensor)
+             ORDER BY h.sensor",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(SensorState {
+                sensor: r.get(0)?,
+                state: r.get(1)?,
+                since: r.get(2)?,
+                detail: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Time of the most recent event, if any.
+    pub fn last_event_at(&self) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT MAX(ts) FROM events", [], |r| r.get(0))?)
+    }
+
     /// Mark scans left in 'running' state by a crash as interrupted
     /// (SRS 4.3). Returns how many were found.
     pub fn mark_interrupted_scans(&self) -> Result<usize> {
@@ -358,11 +383,32 @@ impl Store {
                 "SELECT COUNT(*) FROM coverage_gaps WHERE closed_at IS NULL",
             )?,
             last_full_scan: last_scan("full")?,
-            last_verification: last_scan("baseline")?,
+            // Any completed scan that compared against the baseline: manual
+            // `scan --baseline`, the agent's reconciliation and critical scans.
+            last_verification: self
+                .conn
+                .query_row(
+                    "SELECT finished_at FROM scan_history WHERE status = 'completed'
+                       AND (type IN ('baseline', 'critical')
+                            OR json_extract(detail, '$.baseline_version') IS NOT NULL)
+                     ORDER BY finished_at DESC LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?,
             agent_state: last_agent.as_ref().map(|a| a.0.clone()),
             agent_state_since: last_agent.map(|a| a.1),
         })
     }
+}
+
+/// A sensor's latest recorded state.
+#[derive(Debug, Clone, Serialize)]
+pub struct SensorState {
+    pub sensor: String,
+    pub state: String,
+    pub since: String,
+    pub detail: Option<String>,
 }
 
 /// Figures shown by `soteria status`.

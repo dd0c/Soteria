@@ -238,6 +238,9 @@ pub enum AlertsCommand {
         severity: Option<String>,
         #[arg(long)]
         status: Option<String>,
+        /// Maximum number of rows
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
     },
     /// Show one alert with its evidence
     Show { id: u64 },

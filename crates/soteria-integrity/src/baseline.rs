@@ -380,6 +380,42 @@ pub fn verify(store: &Store, version: u32, key: &VerifyingKey) -> Result<Verific
     })
 }
 
+/// The approved state of one path in a baseline version, if recorded.
+pub fn entry(store: &Store, version: u32, path: &std::path::Path) -> Result<Option<FileRecord>> {
+    let info = get(store, version)?;
+    Ok(store
+        .connection()
+        .prepare_cached(&format!(
+            "SELECT {COLUMNS} FROM baseline_entries WHERE baseline_id = ?1 AND path = ?2"
+        ))?
+        .query_row(params![info.id, path_bytes(path)], |r| rows::from_row(r, 0))
+        .optional()?)
+}
+
+/// Paths of a version's entries whose kinds are in `kinds`, in path order.
+pub fn entry_paths(
+    store: &Store,
+    version: u32,
+    kinds: &[soteria_core::FileKind],
+) -> Result<Vec<std::path::PathBuf>> {
+    let info = get(store, version)?;
+    let wanted: Vec<&str> = kinds.iter().map(|k| k.as_str()).collect();
+    let mut stmt = store
+        .connection()
+        .prepare("SELECT path, kind FROM baseline_entries WHERE baseline_id = ?1 ORDER BY path")?;
+    let rows = stmt.query_map([info.id], |r| {
+        Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, String>(1)?))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (path, kind) = row?;
+        if wanted.contains(&kind.as_str()) {
+            out.push(rows::path_from_bytes(path));
+        }
+    }
+    Ok(out)
+}
+
 /// Compare two baseline versions (FR-008).
 pub fn diff_versions(
     store: &Store,

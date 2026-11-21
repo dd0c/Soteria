@@ -10,7 +10,7 @@ use serde::Serialize;
 use soteria_config::{Config, IssueLevel, ValidateOptions, has_errors};
 use soteria_core::{ExitStatus, Severity};
 use soteria_platform::{Platform, ProbeState};
-use soteria_store::{Store, StoreError, Summary};
+use soteria_store::{SensorState, Store, StoreError, Summary};
 
 use crate::cli::GlobalArgs;
 use crate::context::{BaselineCheck, check_latest_baseline};
@@ -29,6 +29,10 @@ pub struct StatusReport {
     pub integrity: &'static str,
     pub baseline_seal: Option<BaselineCheck>,
     pub monitoring: Option<AgentHealth>,
+    pub sensors: Vec<SensorState>,
+    /// The agent's latest health snapshot (queues, scan state, schedules).
+    pub agent: Option<serde_json::Value>,
+    pub last_event: Option<String>,
     pub indexed_files: Option<u64>,
     pub open_alerts: Option<AlertCounts>,
     pub last_full_scan: Option<String>,
@@ -94,12 +98,17 @@ pub struct AlertCounts {
 pub struct Coverage {
     pub open_gaps: u64,
     pub disabled_monitors: Vec<String>,
+    /// Enabled monitors the running agent reports as not working.
+    pub impaired_monitors: Vec<String>,
     pub unavailable_capabilities: Vec<String>,
 }
 
 impl Coverage {
     fn total(&self) -> usize {
-        self.open_gaps as usize + self.disabled_monitors.len() + self.unavailable_capabilities.len()
+        self.open_gaps as usize
+            + self.disabled_monitors.len()
+            + self.impaired_monitors.len()
+            + self.unavailable_capabilities.len()
     }
 }
 
@@ -210,6 +219,9 @@ fn build(global: &GlobalArgs) -> (StatusReport, ExitStatus) {
     let mut summary: Option<Summary> = None;
     let mut agent = None;
     let mut seal = None;
+    let mut sensors = Vec::new();
+    let mut agent_snapshot = None;
+    let mut last_event = None;
     if let Some(cfg) = &config {
         match Store::open_read_only(&cfg.general.database) {
             Ok(store) => match store.summary() {
@@ -217,6 +229,18 @@ fn build(global: &GlobalArgs) -> (StatusReport, ExitStatus) {
                     database.state = "ok";
                     agent = Some(agent_health(&store, &s));
                     summary = Some(s);
+                    sensors = store
+                        .sensor_states()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|s| s.sensor != "agent" && s.sensor != "baseline")
+                        .collect();
+                    agent_snapshot = store
+                        .meta(soteria_agent::HEALTH_KEY)
+                        .ok()
+                        .flatten()
+                        .and_then(|h| serde_json::from_str(&h).ok());
+                    last_event = store.last_event_at().ok().flatten();
                     seal = Some(match check_latest_baseline(&store, cfg) {
                         Ok(c) => c,
                         Err(f) => BaselineCheck::Unverifiable {
@@ -271,6 +295,17 @@ fn build(global: &GlobalArgs) -> (StatusReport, ExitStatus) {
     let running = agent
         .as_ref()
         .is_some_and(|a| a.state == AgentState::Running);
+    if running {
+        for sensor in &sensors {
+            if matches!(sensor.state.as_str(), "failed" | "unavailable" | "degraded") {
+                coverage.impaired_monitors.push(format!(
+                    "{}: {}",
+                    sensor_label(&sensor.sensor),
+                    sensor.state
+                ));
+            }
+        }
+    }
     let protection = if database.state == "not_initialized" {
         Protection::NotInitialized
     } else if running && sealed_ok && coverage.total() == 0 {
@@ -297,6 +332,9 @@ fn build(global: &GlobalArgs) -> (StatusReport, ExitStatus) {
         baseline_seal: seal.clone(),
         baseline,
         monitoring: agent,
+        sensors,
+        agent: agent_snapshot,
+        last_event,
         indexed_files: summary.as_ref().map(|s| s.indexed_files),
         open_alerts: summary.as_ref().map(|s| AlertCounts {
             total: s.open_alert_total(),
@@ -340,6 +378,27 @@ fn print_text(r: &StatusReport, out: &Output) {
         out.paint(tone_for(monitoring == "RUNNING"), monitoring)
     );
 
+    if !r.sensors.is_empty() {
+        let parts: Vec<String> = r
+            .sensors
+            .iter()
+            .map(|s| {
+                let tone = match s.state.as_str() {
+                    "running" => Tone::Good,
+                    "disabled" | "stopped" => Tone::Dim,
+                    "failed" => Tone::Bad,
+                    _ => Tone::Warn,
+                };
+                format!(
+                    "{} {}",
+                    sensor_label(&s.sensor),
+                    out.paint(tone, &s.state.to_uppercase())
+                )
+            })
+            .collect();
+        println!("Sensors: {}", parts.join(", "));
+    }
+
     let cfg_line = match &r.config.message {
         Some(m) => format!("{} ({m})", r.config.state),
         None if r.config.warnings > 0 => {
@@ -381,6 +440,7 @@ fn print_text(r: &StatusReport, out: &Output) {
             "Last integrity verification: {}",
             r.last_integrity_verification.as_deref().unwrap_or("never")
         );
+        println!("Last event: {}", r.last_event.as_deref().unwrap_or("none"));
     }
     let gaps = r.coverage.total();
     if gaps == 0 {
@@ -394,6 +454,13 @@ fn print_text(r: &StatusReport, out: &Output) {
     if r.protection == Protection::NotInitialized {
         println!();
         println!("Soteria is not initialized on this host. Run: sudo soteria init");
+    }
+}
+
+fn sensor_label(sensor: &str) -> &str {
+    match sensor {
+        "fs" => "file integrity",
+        other => other,
     }
 }
 

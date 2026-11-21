@@ -1,5 +1,7 @@
+pub mod alerts;
 pub mod baseline;
 pub mod config;
+pub mod events;
 pub mod init;
 pub mod inventory;
 pub mod scan;
