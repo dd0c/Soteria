@@ -1,0 +1,64 @@
+## <summary>Soteria host intrusion detection and integrity monitoring.</summary>
+
+########################################
+## <summary>
+##	Read Soteria's configuration, rules and public key.
+## </summary>
+## <param name="domain">
+##	<summary>
+##	Domain allowed access.
+##	</summary>
+## </param>
+#
+interface(`soteria_read_config',`
+	gen_require(`
+		type soteria_conf_t;
+	')
+
+	files_search_etc($1)
+	list_dirs_pattern($1, soteria_conf_t, soteria_conf_t)
+	read_files_pattern($1, soteria_conf_t, soteria_conf_t)
+')
+
+########################################
+## <summary>
+##	Read Soteria's database (status, alerts and reports).
+## </summary>
+## <param name="domain">
+##	<summary>
+##	Domain allowed access.
+##	</summary>
+## </param>
+#
+interface(`soteria_read_db',`
+	gen_require(`
+		type soteria_var_lib_t;
+	')
+
+	files_search_var_lib($1)
+	list_dirs_pattern($1, soteria_var_lib_t, soteria_var_lib_t)
+	read_files_pattern($1, soteria_var_lib_t, soteria_var_lib_t)
+')
+
+########################################
+## <summary>
+##	All of the rules required to administrate Soteria: manage its
+##	configuration, database and logs.
+## </summary>
+## <param name="domain">
+##	<summary>
+##	Domain allowed access.
+##	</summary>
+## </param>
+#
+interface(`soteria_admin',`
+	gen_require(`
+		type soteria_t, soteria_conf_t, soteria_var_lib_t, soteria_log_t;
+	')
+
+	allow $1 soteria_t:process signal_perms;
+	ps_process_pattern($1, soteria_t)
+	admin_pattern($1, soteria_conf_t)
+	admin_pattern($1, soteria_var_lib_t)
+	admin_pattern($1, soteria_log_t)
+')

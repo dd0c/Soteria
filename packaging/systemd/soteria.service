@@ -5,7 +5,13 @@
 # and ProtectKernelModules are deliberately NOT enabled: they would hide /tmp,
 # shell startup files and SSH keys in home directories, and kernel modules
 # from the sensors. Anything a sensor cannot reach is reported as a coverage
-# gap by `soteria status` and `soteria verify`.
+# gap by `soteria status` and `soteria verify`. ProtectKernelModules=no is
+# spelled out for that reason; module loading itself stays impossible, as
+# CAP_SYS_MODULE is outside the bounding set and @module is filtered.
+#
+# Mandatory access control: packaging/selinux (RHEL) and packaging/apparmor
+# (Debian) confine the daemon further. No privileged helper exists; the two
+# read-only capabilities below are all the root access Soteria has.
 
 [Unit]
 Description=Soteria host intrusion detection and integrity monitoring
@@ -52,6 +58,10 @@ ProtectKernelLogs=yes
 ProtectControlGroups=yes
 ProtectProc=default
 PrivateDevices=yes
+PrivateIPC=yes
+RemoveIPC=yes
+KeyringMode=private
+ProtectKernelModules=no
 PrivateNetwork=no
 # AF_INET/AF_INET6 carry email (SMTP relay) and webhook notifications,
 # which are off unless enabled in [alerts]. Sites that never use them can
@@ -65,6 +75,7 @@ MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources @mount @swap @reboot @raw-io @module @debug @cpu-emulation @obsolete
+SystemCallErrorNumber=EPERM
 MemoryMax=300M
 CPUWeight=50
 IOWeight=50
