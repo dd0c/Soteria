@@ -6,6 +6,7 @@
 //! re-verifies paths whose events have settled, accounts for lost events,
 //! and runs scans that are due.
 
+pub mod accounts;
 pub mod alerts;
 pub mod exec;
 mod exec_sensor;
@@ -73,6 +74,8 @@ pub enum AgentError {
     Scan(#[from] scan::ScanError),
     #[error(transparent)]
     Rules(#[from] soteria_rules::RulesError),
+    #[error(transparent)]
+    Store(#[from] soteria_store::StoreError),
 }
 
 pub type Result<T> = std::result::Result<T, AgentError>;
@@ -97,6 +100,8 @@ pub struct Options {
     pub config_path: Option<PathBuf>,
     /// The previous run did not stop cleanly (FR-037): raise SELF-002.
     pub interrupted: Option<selfcheck::Interruption>,
+    /// Where account files are read from (tests use a temporary root).
+    pub accounts: accounts::Sources,
 }
 
 impl Default for Options {
@@ -109,6 +114,7 @@ impl Default for Options {
             exec_sensor: true,
             config_path: None,
             interrupted: None,
+            accounts: accounts::Sources::default(),
         }
     }
 }
@@ -173,6 +179,10 @@ pub struct Agent {
     notifier: Option<notify::Notifier>,
     /// Soteria's own files (FR-036).
     own_files: Vec<PathBuf>,
+    /// Account sources, when account monitoring is enabled (FR-025).
+    accounts: Option<accounts::Sources>,
+    /// An account source changed: compare at the next step.
+    accounts_due: bool,
 }
 
 impl Agent {
@@ -201,6 +211,8 @@ impl Agent {
             rules,
             // Not at once: the startup scan comes first.
             next_retention: now_i + RETENTION_FIRST,
+            accounts: config.monitoring.users.then(|| options.accounts.clone()),
+            accounts_due: false,
             own_files: if config.paths.own_files {
                 scope::self_paths(&config, options.config_path.as_deref())
             } else {
@@ -243,29 +255,42 @@ impl Agent {
         // Monitors that arrive in later milestones are recorded as
         // unavailable rather than silently absent.
         let m = &agent.config.monitoring;
-        let planned = [
-            (
-                "kernel",
-                m.kernel,
-                "kernel and boot monitoring arrives in a later release",
-            ),
-            (
-                "persistence",
-                m.persistence,
-                "persistence monitoring arrives in a later release",
-            ),
-            (
-                "users",
-                m.users,
-                "account monitoring arrives in a later release",
-            ),
-        ];
+        let planned = [(
+            "kernel",
+            m.kernel,
+            "kernel and boot monitoring arrives in a later release",
+        )];
         for (sensor, enabled, detail) in planned {
             if enabled {
                 agent.health(sensor, "unavailable", Some(detail));
             } else {
                 agent.health(sensor, "disabled", Some("disabled by configuration"));
             }
+        }
+        if !agent.config.monitoring.persistence {
+            agent.health("persistence", "disabled", Some("disabled by configuration"));
+        } else if !agent.config.monitoring.file_integrity {
+            agent.health(
+                "persistence",
+                "unavailable",
+                Some("persistence locations are watched by file integrity monitoring, which is disabled"),
+            );
+        } else {
+            let n = agent.config.paths.persistence.len();
+            agent.health(
+                "persistence",
+                "running",
+                Some(&format!("{n} persistence location pattern(s) monitored")),
+            );
+        }
+        if agent.config.monitoring.users {
+            agent.check_accounts()?;
+        } else {
+            agent.health(
+                accounts::SENSOR,
+                "disabled",
+                Some("disabled by configuration"),
+            );
         }
         if !agent.config.monitoring.configuration {
             agent.health(
@@ -455,8 +480,18 @@ impl Agent {
         let paths: Vec<PathBuf> = self.pending.drain().map(|(p, _)| p).collect();
         for p in paths {
             self.verify_path(&p, Source::FsEvent)?;
+            self.note_account_source(&p);
+        }
+        if self.accounts_due {
+            self.check_accounts()?;
         }
         Ok(())
+    }
+
+    fn note_account_source(&mut self, path: &Path) {
+        if self.accounts.as_ref().is_some_and(|s| s.is_source(path)) {
+            self.accounts_due = true;
+        }
     }
 
     fn process_due(&mut self) -> Result<()> {
@@ -471,6 +506,10 @@ impl Agent {
         for path in due {
             self.pending.remove(&path);
             self.verify_path(&path, Source::FsEvent)?;
+            self.note_account_source(&path);
+        }
+        if self.accounts_due {
+            self.check_accounts()?;
         }
         Ok(())
     }
@@ -515,7 +554,7 @@ impl Agent {
     }
 
     fn in_scope(&self, path: &Path) -> bool {
-        !self.scope.is_excluded(path) && self.scope.include.iter().any(|r| path.starts_with(r))
+        self.scope.contains(path)
     }
 
     /// Re-read one object, update the inventory, record an event if it
@@ -766,6 +805,7 @@ impl Agent {
                 Some("recovered after reconciliation"),
             );
         }
+        self.check_accounts()?;
         self.last_reconciliation = Some(now());
         self.scan_state = "idle".into();
         Ok(())

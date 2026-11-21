@@ -23,12 +23,16 @@ pub const AUDIT_RULES_FILE: &str = "/etc/audit/rules.d/soteria.rules";
 /// Configured include and exclude paths, plus persistence locations
 /// (FR-020) and Soteria's own files (FR-036) as optional roots.
 pub fn for_config(config: &Config, config_path: Option<&Path>) -> Scope {
-    let mut optional: Vec<PathBuf> = config
-        .paths
-        .persistence
-        .iter()
-        .flat_map(|p| expand_pattern(p))
-        .collect();
+    let mut optional: Vec<PathBuf> = if config.monitoring.persistence {
+        config
+            .paths
+            .persistence
+            .iter()
+            .flat_map(|p| expand_pattern(p))
+            .collect()
+    } else {
+        Vec::new()
+    };
     if config.paths.own_files {
         optional.extend(self_paths(config, config_path));
     }

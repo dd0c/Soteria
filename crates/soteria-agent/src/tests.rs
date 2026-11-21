@@ -798,3 +798,68 @@ fn tempdir() -> tempfile::TempDir {
         .tempdir()
         .unwrap()
 }
+
+#[test]
+fn account_changes_raise_alerts_through_file_events() {
+    let f = fixture();
+    let etc = f.root.join("etc");
+    fs::write(etc.join("passwd"), "root:x:0:0::/root:/bin/bash\n").unwrap();
+    fs::write(etc.join("group"), "root:x:0:\nwheel:x:10:\n").unwrap();
+    let mut options = quiet();
+    options.accounts = accounts::Sources {
+        root: f.root.clone(),
+    };
+    let mut agent = start(&f, options);
+    // The first snapshot is the reference: nothing to report.
+    assert!(!alerts(&agent).iter().any(|a| a.0.starts_with("ACC-")));
+
+    fs::write(
+        etc.join("passwd"),
+        "root:x:0:0::/root:/bin/bash\nsupport:x:0:0::/tmp:/bin/bash\n",
+    )
+    .unwrap();
+    wait_for(&mut agent, "account alerts", |a| {
+        alerts(a).iter().any(|x| x.0 == "ACC-004")
+    });
+    let a = alerts(&agent);
+    let uid0 = a.iter().find(|x| x.0 == "ACC-004").unwrap();
+    // Named as on the host, so it correlates with the file alert.
+    assert_eq!(uid0.1, "/etc/passwd");
+    assert_eq!(uid0.2, "critical");
+    // Unchanged on the next check: nothing new.
+    let n = a.len();
+    agent.check_accounts().unwrap();
+    assert_eq!(alerts(&agent).len(), n);
+    agent.shutdown();
+}
+
+#[test]
+fn changes_to_own_files_are_critical() {
+    let mut f = fixture();
+    let cfg = f.root.join("etc/app.conf");
+    f.config.paths.own_files = true;
+    let mut options = quiet();
+    options.config_path = Some(cfg.clone());
+    let mut agent = start(&f, options);
+    fs::write(&cfg, "a = 2\n").unwrap();
+    agent.verify_path(&cfg, Source::FsEvent).unwrap();
+    let a = alerts(&agent);
+    assert_eq!(a.len(), 1, "{a:?}");
+    assert_eq!(a[0].0, "SELF-001");
+    assert_eq!(a[0].2, "critical");
+    agent.shutdown();
+}
+
+#[test]
+fn an_unclean_stop_is_reported_at_start() {
+    let f = fixture();
+    let (store, _) = Store::create_or_migrate(&f.db).unwrap();
+    store.record_health("agent", "running", None).unwrap();
+    let previous = selfcheck::previous_run(&store).unwrap();
+    assert!(previous.is_some());
+    let mut options = quiet();
+    options.interrupted = previous;
+    let agent = Agent::start(f.config.clone(), store, options).unwrap();
+    assert!(alerts(&agent).iter().any(|a| a.0 == "SELF-002"));
+    agent.shutdown();
+}
