@@ -23,7 +23,25 @@ rules in effect, and `soteria rules show ID` describes one.
 | `EXE-003` | execution | high | Deleted or memory-only program run |
 | `EXE-004` | execution | high | Network service started a shell |
 | `EXE-005` | execution | medium | Interpreter ran a recently changed script |
+| `EXE-006` | execution | high | Program not trusted by the baseline gave a user root privileges |
 | `INT-001` | integrity | critical | Approved baseline failed verification |
+| `SELF-001` | integrity | critical | Soteria's own program, configuration, rules, keys, audit rule or unit changed |
+| `SELF-002` | integrity | medium | The previous run did not stop cleanly |
+| `ACC-001` | account | medium, critical for UID 0 | Account created |
+| `ACC-002` | account | medium | Account deleted |
+| `ACC-003` | account | high, critical when the new ID is 0 | UID or GID changed |
+| `ACC-004` | account | critical | An account other than root has UID 0 |
+| `ACC-005` | account | high | Account added to a privileged group (wheel, sudo, docker, ...) |
+| `ACC-006` | account | high | Sudo rights granted to a new user or group |
+| `ACC-007` | account | medium, high when a no-login account gets a shell | Login shell changed |
+| `ACC-008` | account | medium, high for UID 0 | SSH authorized key added |
+| `ACC-009` | account | high, medium without a login shell | Account with an empty password |
+| `ACC-010` | account | low | Group created or deleted |
+| `KRN-001` | kernel | high | Loaded module not in the baseline, or without a module file |
+| `KRN-002` | kernel | high | Kernel tainted by a proprietary, forced, out-of-tree or unsigned module |
+| `KRN-003` | kernel | medium, high when security is weakened | Boot parameters changed |
+| `KRN-004` | kernel | high | Secure Boot turned off |
+| `KRN-005` | kernel | low | A different kernel is running |
 
 "By object" severities depend on the object's category and the change; see
 [CLI.md](CLI.md#baselines).

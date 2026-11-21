@@ -27,9 +27,9 @@ Crates are added when their milestone starts; milestone 1 creates `core`,
 `config`, `platform`, `store` and the `soteria` binary (in `crates/soteria-cli`).
 
 Single binary: `/usr/bin/soteria` is both CLI and daemon (`soteria daemon`,
-started by `soteria.service`), as SRS 8.1 allows. A small privileged helper in
-`/usr/libexec/soteria/` is added in M6 only for collection the `soteria` user
-cannot do.
+started by `soteria.service`), as SRS 8.1 allows. There is no privileged
+helper: everything Soteria collects can be read with two read-only
+capabilities (decided 2026-11-21).
 
 ## Milestones
 
@@ -40,7 +40,7 @@ cannot do.
 | M3 | Integrity monitoring | 3 | FR-014..017, FR-032, FR-036..039, NFR-006 | Daemon, inotify filesystem sensor, bounded queues, event re-verification, scheduled reconciliation, coverage gaps, integrity alerts, `status`, health |
 | M4 | Execution monitoring | 4 | FR-009..013 | Audit netlink execution sensor, process records, classification, unusual-location detection, lineage, `processes` search |
 | M5 | Detection and incidents | 5 | FR-018, FR-021, FR-028..031, FR-035 | TOML rule engine, severity, correlation, alert lifecycle (ack, investigated, notes, suppress), retention, JSON/CSV/text export, journald/email/webhook notifications |
-| M6 | System monitoring and hardening | 6 | FR-019/020, FR-022..027, NFR-008..016 | Config, persistence, account, kernel/boot monitoring, self-integrity, privileged helper with authenticated IPC, SELinux policy module, AppArmor profile, systemd hardening |
+| M6 | System monitoring and hardening | 6 | FR-019/020, FR-022..027, NFR-008..016 | Config, persistence, account, kernel/boot monitoring, self-integrity, SELinux policy module, AppArmor profile, systemd hardening |
 | M7 | Packaging and release | 7 | 9, 11, 12, 13 | RPM (RHEL 9/10), DEB (Debian 13), install/upgrade/remove scripts, container-based test matrix, benchmarks, admin documentation |
 
 Progress: M1 to M4 merged (PRs #1 to #4). M5 in review.
@@ -72,9 +72,9 @@ Progress: M1 to M4 merged (PRs #1 to #4). M5 in review.
   failed, `5` not initialized, `6` permission denied, `7` unavailable on this
   platform or build, `10` internal error. See [CLI.md](CLI.md).
 - **Privilege (5.4):** daemon runs as `soteria` with
-  `AmbientCapabilities=CAP_DAC_READ_SEARCH CAP_AUDIT_READ`; anything more
-  goes through the M6 helper. Until then,
-  missing capabilities are reported as coverage gaps, not hidden.
+  `AmbientCapabilities=CAP_DAC_READ_SEARCH CAP_AUDIT_READ` and nothing
+  more; there is no privileged helper. Anything it cannot read is reported
+  as a coverage gap, not hidden.
 
 ## Additions and interpretations of the SRS
 
@@ -148,3 +148,31 @@ Progress: M1 to M4 merged (PRs #1 to #4). M5 in review.
 21. CLI additions beyond SRS 6: `alerts close|reopen|note|suppressions|
     unsuppress|incidents|incident`, `rules validate`, `report scans`, and
     `config test-notifications`.
+22. Persistence locations outside `paths.include` (SSH keys, shell
+    startup files, per-user units, autostart entries, cron and at spools)
+    are configured as `paths.persistence` patterns (`*` and `?` within one
+    component). They are expanded when the daemon starts and when a scan
+    runs, so homes created later are covered from the next restart or
+    scan; a missing location is not a coverage gap.
+23. Soteria's own program, configuration, rules, keys, audit rule and unit
+    files are always monitored (`paths.own_files`, default on; turning it
+    off is a validation warning), and any change to them is SELF-001,
+    critical. An unclean stop of the previous run is SELF-002 (FR-037).
+    The database is protected by its integrity check and the baseline
+    seal rather than by hashing, since it changes constantly.
+24. Accounts (FR-025) are compared as snapshots (accounts, groups, sudo
+    principals, SSH key fingerprints) whenever their files change, at
+    start and at reconciliation; alerts ACC-001..ACC-010 name the file the
+    change is in, so they join the matching file alert in an incident.
+    Only local files are read (no LDAP/SSSD), and only the default
+    `authorized_keys` locations.
+25. Kernel state (FR-022..FR-024) is polled every minute: a module loaded
+    and unloaded in between is not seen, but the taint it leaves is
+    (KRN-002). `scanning.kernel_scan_interval` is kept for compatibility;
+    `soteria scan --kernel` shows the state on demand without recording it.
+26. Privilege transitions (FR-026): EXE-006 when a program not trusted by
+    the baseline runs with effective UID 0 for another user. setuid,
+    setgid and capability changes remain FIM-004/FIM-006.
+27. Authentication anomalies (FR-027, P2) are not implemented in 1.0.
+28. The SELinux module and AppArmor profile are built and parsed in CI;
+    they are exercised on real RHEL and Debian hosts in M7's test matrix.

@@ -36,7 +36,7 @@ usage > not initialized > unavailable > findings > ok.
 |---|---|
 | `soteria status` | Host, OS support level, protection state, baseline and seal state, agent liveness, sensor states, counts, last event, coverage gaps. |
 | `soteria init [--yes \| --non-interactive]` | Prerequisites, platform capabilities, database, signing key, full inventory, draft baseline with review, and approval. Without a terminal or `--yes` the draft is kept for later approval. |
-| `soteria scan [--full \| --dir PATH \| --file PATH \| --baseline]` | Inventory scans. `--baseline` first verifies the approved baseline's seal, then rescans and lists every deviation with a severity. `--kernel` arrives with milestone 6. |
+| `soteria scan [--full \| --dir PATH \| --file PATH \| --baseline]` | Inventory scans. `--baseline` first verifies the approved baseline's seal, then rescans and lists every deviation with a severity. `--kernel` shows the running kernel, boot parameters, Secure Boot, lockdown, taint and modules, and what changed since the daemon last recorded them (exit 1 when something did). |
 | `soteria inventory [--kind K] [--path P] [--sha256 H] [--limit N]` | Lists indexed objects. |
 | `soteria baseline list\|show\|create\|review\|approve\|diff` | Baseline lifecycle; see below. |
 | `soteria config show\|validate\|default` | Configuration. `validate` also checks the administrator rule files. |
@@ -118,10 +118,27 @@ changes to binaries, libraries, kernel files and security-sensitive files are
   be disabled or given a fixed severity; see
   [Detection rules](#detection-rules).
 - **Executions (FR-009..FR-012).** See below.
-- **Not yet monitored.** Kernel, persistence and account monitoring arrive
-  in a later milestone. While they are enabled in the
-  configuration, `status` lists them as `UNAVAILABLE`, and protection shows
-  `DEGRADED` rather than `ACTIVE`.
+- **Persistence (FR-020).** `paths.persistence` lists SSH key directories,
+  shell startup files, per-user systemd units, autostart entries and the
+  cron and at spools, with `*` and `?` matching one path component. They
+  are inventoried, baselined and watched like included paths, but one that
+  does not exist is not a gap. Homes created later are covered from the
+  next daemon restart or scan.
+- **Soteria's own files (FR-036, FR-037).** The program, configuration,
+  rules directory, baseline keys, `/etc/audit/rules.d/soteria.rules` and
+  the unit files are always monitored; any change is `SELF-001`
+  (critical). Approve a new baseline after an intended change. If the
+  daemon did not stop cleanly last time, the next start raises `SELF-002`.
+- **Accounts (FR-025).** The daemon compares local accounts, groups, sudo
+  rules and SSH authorized keys with its last snapshot whenever one of
+  their files changes, and at every start and reconciliation, raising
+  `ACC-001`..`ACC-010`. Password hashes are never stored, only whether a
+  password is set, empty or locked. LDAP and SSSD accounts are not covered.
+- **Kernel and boot (FR-022..FR-024).** Every minute the daemon reads the
+  running kernel, command line, Secure Boot and lockdown state, taint and
+  loaded modules, records each boot as a `kernel.boot` event, and raises
+  `KRN-001`..`KRN-005`. A module counts as unknown when its file is not in
+  the approved baseline or it has no file for the running kernel.
 
 ## Execution monitoring
 
