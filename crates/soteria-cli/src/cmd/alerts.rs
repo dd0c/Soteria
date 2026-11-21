@@ -91,6 +91,8 @@ fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<AlertRow> {
 pub fn run(cmd: &AlertsCommand, global: &GlobalArgs, out: &Output) -> CmdResult {
     match cmd {
         AlertsCommand::List { filter, limit } => list(global, out, filter, *limit),
+        AlertsCommand::Incidents { all } => incidents(global, out, *all),
+        AlertsCommand::Incident { id } => incident(global, out, *id),
         AlertsCommand::Show { id } => show(global, out, *id),
         AlertsCommand::Ack { id, note } => {
             status(global, out, *id, "acknowledged", note.as_deref())
@@ -237,7 +239,8 @@ fn filter_sql(f: &AlertFilter) -> Result<(&'static str, Vec<rusqlite::types::Val
          AND (?3 IS NULL OR instr(?3, ',' || severity || ',') > 0)
          AND (?4 IS NULL OR status = ?4)
          AND (?5 IS NULL OR rule_id = upper(?5))
-         AND (?6 IS NULL OR instr(object, ?6) > 0)",
+         AND (?6 IS NULL OR instr(object, ?6) > 0)
+         AND (?7 IS NULL OR incident_id = ?7)",
         vec![
             text(since),
             text(until),
@@ -245,6 +248,9 @@ fn filter_sql(f: &AlertFilter) -> Result<(&'static str, Vec<rusqlite::types::Val
             text(f.status.clone()),
             text(f.rule.clone()),
             text(f.object.clone()),
+            f.incident
+                .map(|i| Value::Integer(i as i64))
+                .unwrap_or(Value::Null),
         ],
     ))
 }
@@ -600,4 +606,151 @@ mod tests {
         assert_eq!(csv_field("=cmd()"), "'=cmd()");
         assert_eq!(csv_field("line\nbreak"), "\"line\nbreak\"");
     }
+}
+
+#[derive(Debug, Serialize)]
+struct Incident {
+    id: i64,
+    created_at: String,
+    updated_at: String,
+    severity: String,
+    status: String,
+    title: String,
+    alerts: i64,
+}
+
+fn incident_rows(
+    conn: &rusqlite::Connection,
+    all: bool,
+    id: Option<i64>,
+) -> Result<Vec<Incident>, Failure> {
+    let mut st = conn
+        .prepare(
+            "SELECT i.id, i.created_at, i.updated_at, i.severity, i.status, i.title,
+                    (SELECT COUNT(*) FROM alerts a WHERE a.incident_id = i.id)
+             FROM incidents i
+             WHERE (?1 OR i.status = 'open') AND (?2 IS NULL OR i.id = ?2)
+             ORDER BY i.updated_at DESC, i.id DESC",
+        )
+        .map_err(internal)?;
+    st.query_map(rusqlite::params![all, id], |r| {
+        Ok(Incident {
+            id: r.get(0)?,
+            created_at: r.get(1)?,
+            updated_at: r.get(2)?,
+            severity: r.get(3)?,
+            status: r.get(4)?,
+            title: r.get(5)?,
+            alerts: r.get(6)?,
+        })
+    })
+    .map_err(internal)?
+    .collect::<rusqlite::Result<_>>()
+    .map_err(internal)
+}
+
+fn incidents(global: &GlobalArgs, out: &Output, all: bool) -> CmdResult {
+    let (config, _) = load_config(&global.config)?;
+    let store = open_store_read_only(&config)?;
+    let rows = incident_rows(store.connection(), all, None)?;
+    if out.json {
+        out.print_json(&rows);
+        return Ok(ExitStatus::Ok);
+    }
+    if rows.is_empty() {
+        println!(
+            "{}",
+            if all {
+                "No incidents."
+            } else {
+                "No open incidents."
+            }
+        );
+        return Ok(ExitStatus::Ok);
+    }
+    println!(
+        "{}",
+        out.paint(
+            Tone::Bold,
+            &format!(
+                "{:>6}  {:<24}  {:<8}  {:<6}  {:>6}  TITLE",
+                "ID", "UPDATED", "SEVERITY", "STATUS", "ALERTS"
+            )
+        )
+    );
+    for i in &rows {
+        let sev: soteria_core::Severity =
+            i.severity.parse().unwrap_or(soteria_core::Severity::Info);
+        println!(
+            "{:>6}  {:<24}  {}  {:<6}  {:>6}  {}",
+            i.id,
+            i.updated_at,
+            out.paint(
+                severity_tone(sev),
+                &format!("{:<8}", i.severity.to_uppercase())
+            ),
+            i.status,
+            i.alerts,
+            i.title
+        );
+    }
+    Ok(ExitStatus::Ok)
+}
+
+fn incident(global: &GlobalArgs, out: &Output, id: u64) -> CmdResult {
+    let (config, _) = load_config(&global.config)?;
+    let store = open_store_read_only(&config)?;
+    let conn = store.connection();
+    let Some(inc) = incident_rows(conn, true, Some(id as i64))?.pop() else {
+        return Err(Failure::new(
+            ExitStatus::Usage,
+            format!("no incident with id {id}"),
+        ));
+    };
+    let filter = AlertFilter {
+        range: Default::default(),
+        severity: None,
+        status: None,
+        rule: None,
+        object: None,
+        incident: Some(id),
+    };
+    let (_, mut alerts) = query_rows(conn, &filter, None)?;
+    alerts.reverse();
+    if out.json {
+        out.print_json(&serde_json::json!({ "incident": inc, "alerts": alerts }));
+        return Ok(ExitStatus::Ok);
+    }
+    println!(
+        "{}",
+        out.paint(
+            Tone::Bold,
+            &format!(
+                "Incident {} | Severity: {} | Status: {}",
+                inc.id,
+                inc.severity.to_uppercase(),
+                inc.status.to_uppercase()
+            )
+        )
+    );
+    println!("{}", inc.title);
+    println!(
+        "First alert {} | Last update {}",
+        inc.created_at, inc.updated_at
+    );
+    println!();
+    for a in &alerts {
+        println!(
+            "  {:>6}  {}  {:<8}  {:<12}  {:<8}  {}",
+            a.id,
+            a.created_at,
+            a.severity.to_uppercase(),
+            a.status,
+            a.rule_id,
+            a.object.as_deref().unwrap_or("-")
+        );
+    }
+    println!();
+    println!("Show one alert with: soteria alerts show ID");
+    Ok(ExitStatus::Ok)
 }

@@ -9,6 +9,7 @@
 pub mod alerts;
 pub mod exec;
 mod exec_sensor;
+pub mod incidents;
 pub mod lifecycle;
 pub mod rules;
 
@@ -376,6 +377,17 @@ impl Agent {
             self.critical_scan()?;
             self.next_critical = Instant::now() + self.config.scanning.critical_scan_interval.0;
         }
+        self.after_alerts()?;
+        Ok(())
+    }
+
+    /// Work on alerts recorded since the last step: group related ones into
+    /// incidents (FR-018).
+    pub fn after_alerts(&mut self) -> Result<()> {
+        incidents::correlate_pending(
+            self.store.connection(),
+            self.config.alerts.correlation_window.0,
+        )?;
         Ok(())
     }
 

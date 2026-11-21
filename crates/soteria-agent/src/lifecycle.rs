@@ -37,6 +37,19 @@ fn status_of(conn: &Connection, id: i64) -> Result<String> {
     .ok_or(LifecycleError::NoSuchAlert(id))
 }
 
+/// Keep the alert's incident status and severity in step.
+fn refresh_incident(conn: &Connection, alert_id: i64) -> Result<()> {
+    let incident: Option<i64> = conn.query_row(
+        "SELECT incident_id FROM alerts WHERE id = ?1",
+        [alert_id],
+        |r| r.get(0),
+    )?;
+    if let Some(i) = incident {
+        crate::incidents::refresh(conn, i)?;
+    }
+    Ok(())
+}
+
 /// Change an alert's status, optionally with a note. Returns the previous
 /// status.
 pub fn set_status(
@@ -68,6 +81,7 @@ pub fn set_status(
             note.map(str::trim).filter(|n| !n.is_empty())
         ],
     )?;
+    refresh_incident(&tx, id)?;
     tx.commit()?;
     Ok(from)
 }
@@ -164,6 +178,7 @@ pub fn suppress(
                 format!("suppression {sid}: {reason}")
             ],
         )?;
+        refresh_incident(&tx, alert_id)?;
     }
     tx.commit()?;
     Ok(sid)

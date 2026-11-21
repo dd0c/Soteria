@@ -564,6 +564,47 @@ fn alert_lifecycle_suppression_and_export() {
 }
 
 #[test]
+fn incidents_are_listed_and_close_with_their_alerts() {
+    let env = Env::new();
+    env.init();
+    let a = insert_alert(&env, "/usr/local/bin/x");
+    let b = insert_alert(&env, "/tmp/other");
+    {
+        let c = rusqlite::Connection::open(env.db()).unwrap();
+        c.execute(
+            "INSERT INTO incidents (created_at, updated_at, severity, title, status)
+             VALUES ('2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z', 'high', 'Changed program executed', 'open')",
+            [],
+        )
+        .unwrap();
+        let i = c.last_insert_rowid();
+        c.execute(
+            "UPDATE alerts SET incident_id = ?1 WHERE id IN (?2, ?3)",
+            rusqlite::params![i, a, b],
+        )
+        .unwrap();
+    }
+    let (code, v) = env.json(&["alerts", "incidents"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v[0]["alerts"], 2);
+    let (code, v) = env.json(&["alerts", "incident", "1"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["alerts"].as_array().unwrap().len(), 2);
+    let (_, v) = env.json(&["alerts", "list", "--incident", "1"]);
+    assert_eq!(v["total_matching"], 2);
+    assert_eq!(env.json(&["alerts", "incident", "9"]).0, 2);
+
+    env.json(&["alerts", "close", &a.to_string()]);
+    let (_, v) = env.json(&["alerts", "incidents"]);
+    assert_eq!(v.as_array().unwrap().len(), 1, "one alert still open");
+    env.json(&["alerts", "close", &b.to_string()]);
+    let (_, v) = env.json(&["alerts", "incidents"]);
+    assert_eq!(v.as_array().unwrap().len(), 0, "{v}");
+    let (_, v) = env.json(&["alerts", "incidents", "--all"]);
+    assert_eq!(v[0]["status"], "closed");
+}
+
+#[test]
 fn rules_list_show_and_validate() {
     let env = Env::new();
     env.init();

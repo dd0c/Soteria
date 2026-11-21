@@ -164,6 +164,8 @@ impl Default for Baseline {
 #[serde(deny_unknown_fields, default)]
 pub struct Alerts {
     pub minimum_severity: Severity,
+    /// Related alerts this close together are grouped into incidents.
+    pub correlation_window: HumanDuration,
     pub journal: bool,
     pub email: bool,
     pub webhook: bool,
@@ -247,6 +249,7 @@ impl Default for Alerts {
     fn default() -> Self {
         Alerts {
             minimum_severity: Severity::Low,
+            correlation_window: HumanDuration::from_secs(3600),
             journal: true,
             email: false,
             webhook: false,
@@ -545,6 +548,16 @@ impl Config {
         }
 
         // [alerts]
+        let w = self.alerts.correlation_window.0;
+        if w < Duration::from_secs(60) || w > Duration::from_secs(7 * 24 * 3600) {
+            v.error(
+                "alerts.correlation_window",
+                format!(
+                    "{} must be between 1 minute and 7 days",
+                    self.alerts.correlation_window
+                ),
+            );
+        }
         if self.alerts.minimum_severity > Severity::Medium {
             v.warning(
                 "alerts.minimum_severity",

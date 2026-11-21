@@ -69,6 +69,9 @@ public_key = "/etc/soteria/keys/baseline.pub"
 [alerts]
 # One of: critical, high, medium, low, info
 minimum_severity = "low"
+# Related alerts (same object, a changed program that then ran, one login
+# session or process chain) this close together form an incident.
+correlation_window = "1h"
 journal = true
 email = false
 webhook = false

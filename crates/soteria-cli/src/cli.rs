@@ -203,7 +203,7 @@ pub struct InventoryArgs {
     pub limit: u32,
 }
 
-#[derive(Debug, Clone, Args)]
+#[derive(Debug, Clone, Default, Args)]
 pub struct TimeRange {
     /// Start time (RFC 3339) or age such as "2h"
     #[arg(long)]
@@ -287,6 +287,14 @@ pub enum AlertsCommand {
     },
     /// Remove a suppression
     Unsuppress { suppression_id: u64 },
+    /// List incidents (groups of related alerts)
+    Incidents {
+        /// Include closed incidents
+        #[arg(long)]
+        all: bool,
+    },
+    /// Show an incident and its alerts
+    Incident { id: u64 },
     /// Export alerts with evidence and history
     Export {
         #[arg(long, value_enum, default_value_t = ExportFormat::Json)]
@@ -315,6 +323,9 @@ pub struct AlertFilter {
     /// Text contained in the affected object (file or program path)
     #[arg(long)]
     pub object: Option<String>,
+    /// Only alerts in this incident
+    #[arg(long)]
+    pub incident: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
