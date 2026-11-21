@@ -1,0 +1,46 @@
+# Soteria configuration (/etc/soteria/soteria.toml)
+#
+# Validate changes with:  soteria config validate
+# Invalid settings stop Soteria from starting; they never silently turn
+# monitoring off. Disabling a monitor below is allowed, but it is reported
+# as a coverage gap by `soteria status` and `soteria verify`.
+
+# Configuration schema version.
+version = 1
+
+[general]
+# One of: error, warn, info, debug, trace
+log_level = "info"
+database = "/var/lib/soteria/soteria.db"
+event_retention_days = 90
+
+[monitoring]
+execution = true
+file_integrity = true
+configuration = true
+kernel = true
+persistence = true
+users = true
+
+[scanning]
+# Durations accept forms such as "30m", "6h" or "1d".
+full_scan_interval = "24h"
+critical_scan_interval = "6h"
+kernel_scan_interval = "24h"
+startup_scan = true
+
+[paths]
+# Paths that do not exist on this distribution are skipped and reported.
+include = [
+  "/etc", "/usr/bin", "/usr/sbin", "/usr/lib", "/usr/lib64",
+  "/boot", "/bin", "/sbin", "/lib", "/lib64", "/usr/local/bin",
+  "/usr/local/sbin"
+]
+exclude = ["/proc", "/sys", "/dev", "/run"]
+
+[alerts]
+# One of: critical, high, medium, low, info
+minimum_severity = "low"
+journal = true
+email = false
+webhook = false

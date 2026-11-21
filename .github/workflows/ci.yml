@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  # Build and test on each supported OS (SRS 12.5). UBI images stand in for
+  # RHEL 9 and 10 userland; the kernel is the runner's.
+  test:
+    name: test (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: rhel9
+            image: registry.access.redhat.com/ubi9/ubi:latest
+            deps: dnf install -y gcc util-linux
+          - name: rhel10
+            image: registry.access.redhat.com/ubi10/ubi:latest
+            deps: dnf install -y gcc util-linux
+          - name: debian13
+            image: debian:trixie
+            deps: apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev curl ca-certificates procps
+    container:
+      image: ${{ matrix.image }}
+    steps:
+      - name: Install build dependencies
+        run: ${{ matrix.deps }}
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Unprivileged test user
+        run: useradd --create-home tester && chown -R tester "$GITHUB_WORKSPACE"
+      - name: Test as root
+        run: cargo test --workspace --locked
+      - name: Test as an unprivileged user
+        run: |
+          chmod a+x "$HOME"
+          chmod -R a+rX "$HOME/.rustup" "$HOME/.cargo/bin"
+          su tester -c "PATH=$HOME/.cargo/bin:/usr/bin:/bin RUSTUP_HOME=$HOME/.rustup CARGO_HOME=/home/tester/.cargo CARGO_TARGET_DIR=/home/tester/target cargo test --workspace --locked"
