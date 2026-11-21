@@ -1,0 +1,23 @@
+#!/bin/sh
+# Soteria removal (SRS 11.4): security data is never deleted silently.
+set -e
+
+case "$1" in
+remove|purge)
+	if [ -d /run/systemd/system ]; then
+		systemctl daemon-reload >/dev/null || true
+	fi
+	if [ -x /usr/sbin/apparmor_parser ] && [ "$1" = purge ]; then
+		apparmor_parser -R /etc/apparmor.d/usr.bin.soteria >/dev/null 2>&1 || true
+	fi
+	if [ -d /var/lib/soteria ] || [ -d /etc/soteria/keys ]; then
+		cat <<'MSG'
+Soteria's database, baselines, keys, rules and logs were kept:
+  /var/lib/soteria  /etc/soteria  /var/log/soteria
+To delete them deliberately:
+  sudo rm -rf /var/lib/soteria /etc/soteria /var/log/soteria && sudo userdel soteria
+MSG
+	fi
+	;;
+esac
+exit 0

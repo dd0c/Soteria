@@ -109,15 +109,24 @@ impl Store {
     /// Open an existing database and apply pending migrations (each in its
     /// own transaction). Used by the daemon, which owns the database, so a
     /// package upgrade does not need a manual step. Returns the versions
-    /// applied.
+    /// applied. Before migrating, the database is copied to
+    /// `<db>.schema-<N>.bak` so the upgrade can be undone.
     pub fn open_and_migrate(path: &Path) -> Result<(Store, Vec<u32>)> {
         match Store::open(path) {
             Ok(store) => Ok((store, Vec::new())),
-            Err(StoreError::NeedsMigration { .. }) => {
+            Err(StoreError::NeedsMigration { found, .. }) => {
                 let conn = Connection::open_with_flags(
                     path,
                     OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
                 )?;
+                // A consistent copy first, so an upgrade can be undone
+                // (SRS 11.3): <db>.schema-<old version>.bak, kept.
+                if found > 0 {
+                    let backup = backup_path(path, found);
+                    if !backup.exists() {
+                        conn.execute("VACUUM INTO ?1", [backup.to_string_lossy()])?;
+                    }
+                }
                 let mut store = Store::configure(conn, path)?;
                 let applied = store.migrate()?;
                 Ok((store, applied))
@@ -492,6 +501,13 @@ pub fn new_id() -> String {
     buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Where the copy taken before migrating from schema `version` goes.
+pub fn backup_path(db: &Path, version: u32) -> std::path::PathBuf {
+    let mut name = db.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".schema-{version}.bak"));
+    db.with_file_name(name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -729,6 +745,9 @@ mod tests {
         let (store, applied) = Store::open_and_migrate(&path).unwrap();
         assert_eq!(applied, vec![SCHEMA_VERSION]);
         assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        // The pre-upgrade copy still has the old schema.
+        let backup = Store::open(&backup_path(&path, SCHEMA_VERSION - 1));
+        assert!(matches!(backup, Err(StoreError::NeedsMigration { .. })));
         let (_, applied) = Store::open_and_migrate(&path).unwrap();
         assert!(applied.is_empty());
     }
