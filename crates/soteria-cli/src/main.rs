@@ -4,6 +4,7 @@ mod cli;
 mod cmd;
 mod context;
 mod daemon;
+mod display;
 mod health;
 mod output;
 mod sdnotify;
@@ -13,7 +14,7 @@ use std::process::ExitCode;
 use clap::Parser;
 
 use cli::{Cli, Command};
-use cmd::unavailable::{self, DETECTION, EXECUTION, INTEGRITY, INVENTORY};
+use cmd::unavailable::{self, DETECTION, EXECUTION, INTEGRITY};
 use output::{CmdResult, Output};
 
 fn main() -> ExitCode {
@@ -44,9 +45,9 @@ fn dispatch(cli: &Cli, out: &Output) -> CmdResult {
         Command::Config(c) => cmd::config::run(c, g, out),
         Command::Verify(args) => cmd::verify::run(args, g, out),
         Command::Daemon => daemon::run(g),
-        Command::Scan(_) => unavailable::run("scan", INVENTORY),
-        Command::Baseline(_) => unavailable::run("baseline", INVENTORY),
-        Command::Inventory(_) => unavailable::run("inventory", INVENTORY),
+        Command::Scan(args) => cmd::scan::run(args, g, out),
+        Command::Baseline(c) => cmd::baseline::run(c, g, out),
+        Command::Inventory(args) => cmd::inventory::run(args, g, out),
         Command::Events(_) => unavailable::run("events", INTEGRITY),
         Command::Processes(_) => unavailable::run("processes", EXECUTION),
         Command::Alerts(_) => unavailable::run("alerts", DETECTION),

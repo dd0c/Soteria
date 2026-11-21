@@ -1,19 +1,28 @@
-//! `soteria init` (SRS 11.2).
+//! `soteria init` (SRS 11.2, 10.3).
 //!
-//! This build verifies prerequisites, detects platform capabilities and
-//! creates or migrates the database. Inventory, baseline review and
-//! approval are added to the same workflow in milestone 2.
+//! Verifies prerequisites, detects platform capabilities, creates or migrates
+//! the database, creates the baseline signing key, inventories the host,
+//! prepares a draft baseline with coverage information for review, and asks
+//! for explicit approval. Without approval the draft is kept and can be
+//! approved later with `soteria baseline approve`.
 
+use std::io::IsTerminal;
 use std::os::unix::fs::{DirBuilderExt, chown};
 use std::path::Path;
 
 use serde::Serialize;
 use soteria_core::{CheckState, ExitStatus};
+use soteria_integrity::baseline::{self, BaselineInfo};
+use soteria_integrity::keys;
+use soteria_integrity::scan::{self, ScanReport, ScanResult, ScanTarget};
 use soteria_platform::{Platform, ProbeState};
 use soteria_store::Store;
 
 use crate::cli::{GlobalArgs, InitArgs};
-use crate::context::{Identity, load_config, lookup_user, store_failure};
+use crate::cmd::baseline::{approve, print_review};
+use crate::context::{
+    Identity, baseline_failure, key_failure, load_config, lookup_user, scope, store_failure,
+};
 use crate::output::{CmdResult, Failure, Output};
 
 /// Service account that owns the state directory (SRS 8.2).
@@ -32,51 +41,67 @@ struct InitReport {
     database: String,
     schema_version: u32,
     migrations_applied: Vec<u32>,
-    next: &'static str,
+    scan: Option<ScanReport>,
+    baseline: Option<BaselineInfo>,
+    next: Option<String>,
 }
 
-const NEXT: &str = "Inventory and baseline approval are added to 'soteria init' in milestone 2.";
+/// Collects steps and, in text mode, prints each one as it completes so the
+/// administrator sees progress before the approval question.
+struct Steps<'a> {
+    out: &'a Output,
+    list: Vec<Step>,
+    exit: ExitStatus,
+}
 
-pub fn run(_args: &InitArgs, global: &GlobalArgs, out: &Output) -> CmdResult {
-    let mut steps = Vec::new();
-    let mut exit = ExitStatus::Ok;
-    let mut push = |steps: &mut Vec<Step>, step, state, detail: String| {
+impl Steps<'_> {
+    fn push(&mut self, step: &'static str, state: CheckState, detail: impl Into<String>) {
+        let detail = detail.into();
         if state == CheckState::Warn {
-            exit = exit.worst(ExitStatus::Findings);
+            self.exit = self.exit.worst(ExitStatus::Findings);
         }
-        steps.push(Step {
+        if !self.out.json {
+            println!("{}  {:<16} {}", self.out.check(state), step, detail);
+        }
+        self.list.push(Step {
             step,
             state,
             detail,
         });
+    }
+}
+
+pub fn run(args: &InitArgs, global: &GlobalArgs, out: &Output) -> CmdResult {
+    let mut steps = Steps {
+        out,
+        list: Vec::new(),
+        exit: ExitStatus::Ok,
     };
 
     let who = Identity::current();
-    push(
-        &mut steps,
-        "privileges",
-        if who.is_root() {
-            CheckState::Pass
-        } else {
-            CheckState::Warn
-        },
-        if who.is_root() {
-            format!("running as {}", who.describe())
-        } else {
+    if who.is_root() {
+        steps.push(
+            "privileges",
+            CheckState::Pass,
+            format!("running as {}", who.describe()),
+        );
+    } else {
+        steps.push(
+            "privileges",
+            CheckState::Warn,
             format!(
-                "running as {} without root; system paths may be unreadable",
+                "running as {} without root; system paths may be unreadable and the baseline cannot be approved",
                 who.describe()
-            )
-        },
-    );
+            ),
+        );
+    }
 
     let (config, issues) = load_config(&global.config)?;
     let warnings = issues
         .iter()
         .filter(|i| i.level == soteria_config::IssueLevel::Warning)
         .count();
-    push(
-        &mut steps,
+    steps.push(
         "configuration",
         if warnings == 0 {
             CheckState::Pass
@@ -92,8 +117,7 @@ pub fn run(_args: &InitArgs, global: &GlobalArgs, out: &Output) -> CmdResult {
     match Platform::detect() {
         Ok(p) => {
             let supported = p.support == soteria_platform::SupportLevel::Supported;
-            push(
-                &mut steps,
+            steps.push(
                 "platform",
                 if supported {
                     CheckState::Pass
@@ -108,22 +132,22 @@ pub fn run(_args: &InitArgs, global: &GlobalArgs, out: &Output) -> CmdResult {
                 } else {
                     CheckState::Warn
                 };
-                push(&mut steps, probe.name, state, probe.detail);
+                steps.push(probe.name, state, probe.detail);
             }
         }
-        Err(e) => push(&mut steps, "platform", CheckState::Warn, e.to_string()),
+        Err(e) => steps.push("platform", CheckState::Warn, e.to_string()),
     }
 
+    // Database.
     let db_path = &config.general.database;
     let created_dir = ensure_parent(db_path)?;
     let existed = db_path.exists();
-    let (store, migrations) = Store::create_or_migrate(db_path).map_err(store_failure)?;
+    let (mut store, migrations) = Store::create_or_migrate(db_path).map_err(store_failure)?;
     store
         .set_meta("initialized_by", &who.describe())
         .and_then(|()| store.set_meta("initialized_at", &soteria_store::now()))
         .map_err(store_failure)?;
-    push(
-        &mut steps,
+    steps.push(
         "database",
         CheckState::Pass,
         match (existed, migrations.is_empty()) {
@@ -141,6 +165,131 @@ pub fn run(_args: &InitArgs, global: &GlobalArgs, out: &Output) -> CmdResult {
         },
     );
 
+    // Signing key (FR-006): created once, by root, never overwritten.
+    let (sk, pk) = (&config.baseline.signing_key, &config.baseline.public_key);
+    match (sk.exists(), pk.exists()) {
+        (false, false) if who.is_root() => {
+            let key = keys::generate(sk, pk).map_err(key_failure)?;
+            steps.push(
+                "signing_key",
+                CheckState::Pass,
+                format!(
+                    "created baseline signing key {} ({})",
+                    keys::key_id(&key),
+                    sk.display()
+                ),
+            );
+        }
+        (false, false) => steps.push(
+            "signing_key",
+            CheckState::Warn,
+            "no baseline signing key; run 'sudo soteria init' to create one",
+        ),
+        (true, true) => {
+            let key = keys::load_verifier(pk).map_err(key_failure)?;
+            steps.push(
+                "signing_key",
+                CheckState::Pass,
+                format!("using existing baseline key {}", keys::key_id(&key)),
+            );
+        }
+        (true, false) | (false, true) => {
+            return Err(Failure::new(
+                ExitStatus::IntegrityFailure,
+                format!(
+                    "only one half of the baseline key pair exists ({} / {}); restore the missing file instead of creating a new key",
+                    sk.display(),
+                    pk.display()
+                ),
+            ));
+        }
+    }
+
+    // Inventory.
+    if !out.json {
+        println!("      {:<16} scanning configured paths...", "inventory");
+    }
+    let report = scan::run(&mut store, &scope(&config), &ScanTarget::Full, "full")
+        .map_err(|e| Failure::new(ExitStatus::Internal, format!("inventory scan failed: {e}")))?;
+    steps.push(
+        "inventory",
+        if report.result == ScanResult::Completed {
+            CheckState::Pass
+        } else {
+            CheckState::Warn
+        },
+        format!(
+            "{} objects checked, {} hashed, {} coverage gap(s)",
+            report.checked, report.hashed, report.gap_count
+        ),
+    );
+
+    // Baseline.
+    let (baseline, next) = if let Some(existing) =
+        baseline::latest_approved(&store).map_err(baseline_failure)?
+    {
+        steps.push(
+            "baseline",
+            CheckState::Pass,
+            format!(
+                "baseline v{} is already approved; not replacing it",
+                existing.version
+            ),
+        );
+        (
+            Some(existing),
+            Some("To record authorized changes, run 'soteria baseline create' and approve the new draft.".to_owned()),
+        )
+    } else {
+        let draft = baseline::create_draft(&mut store, &who.describe(), Some("initial baseline"))
+            .map_err(baseline_failure)?;
+        steps.push(
+            "baseline",
+            CheckState::Pass,
+            format!(
+                "draft v{} prepared with {} objects",
+                draft.version, draft.entry_count
+            ),
+        );
+        if !out.json {
+            println!();
+            let review = baseline::review(&store, draft.version, 20).map_err(baseline_failure)?;
+            print_review(out, &review);
+            println!();
+        }
+
+        let interactive = std::io::stdin().is_terminal() && !out.json;
+        let try_approve = who.is_root() && !args.non_interactive && (args.yes || interactive);
+        if try_approve {
+            match approve(&mut store, &config, draft.version, args.yes, out) {
+                Ok(sealed) => {
+                    steps.push(
+                        "approval",
+                        CheckState::Pass,
+                        format!(
+                            "baseline v{} approved by {} and sealed",
+                            sealed.version,
+                            sealed.approved_by.as_deref().unwrap_or("?")
+                        ),
+                    );
+                    (Some(sealed), None)
+                }
+                Err(f) if f.status == ExitStatus::Usage => {
+                    steps.push("approval", CheckState::Warn, f.message);
+                    (Some(draft.clone()), Some(approve_hint(draft.version)))
+                }
+                Err(f) => return Err(f),
+            }
+        } else {
+            steps.push(
+                "approval",
+                CheckState::Warn,
+                format!("draft v{} is waiting for approval", draft.version),
+            );
+            (Some(draft.clone()), Some(approve_hint(draft.version)))
+        }
+    };
+
     // The daemon runs as the service account, so the database must belong
     // to it when root initializes the host.
     if who.is_root() {
@@ -157,15 +306,13 @@ pub fn run(_args: &InitArgs, global: &GlobalArgs, out: &Output) -> CmdResult {
                     )
                 })?;
             }
-            push(
-                &mut steps,
+            steps.push(
                 "ownership",
                 CheckState::Pass,
                 format!("database owned by {SERVICE_USER}"),
             );
         } else {
-            push(
-                &mut steps,
+            steps.push(
                 "ownership",
                 CheckState::Warn,
                 format!(
@@ -175,22 +322,32 @@ pub fn run(_args: &InitArgs, global: &GlobalArgs, out: &Output) -> CmdResult {
         }
     }
 
+    let exit = steps.exit;
     let report = InitReport {
-        steps,
+        steps: steps.list,
         database: db_path.display().to_string(),
         schema_version: soteria_store::SCHEMA_VERSION,
         migrations_applied: migrations,
-        next: NEXT,
+        scan: Some(report),
+        baseline,
+        next: next.clone(),
     };
     if out.json {
         out.print_json(&report);
+    } else if let Some(n) = next {
+        println!("\n{n}");
     } else {
-        for s in &report.steps {
-            println!("{}  {:<16} {}", out.check(s.state), s.step, s.detail);
-        }
-        println!("\n{NEXT}");
+        println!(
+            "\nSoteria is initialized. Start monitoring with: sudo systemctl enable --now soteria"
+        );
     }
     Ok(exit)
+}
+
+fn approve_hint(version: u32) -> String {
+    format!(
+        "Review it with 'soteria baseline review' and approve it with: sudo soteria baseline approve {version}"
+    )
 }
 
 /// Create the database directory with restrictive permissions if it is

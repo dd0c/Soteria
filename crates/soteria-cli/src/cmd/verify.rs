@@ -11,6 +11,7 @@ use soteria_platform::{Platform, ProbeState, SupportLevel};
 use soteria_store::{Store, StoreError};
 
 use crate::cli::{Component, GlobalArgs, VerifyArgs};
+use crate::context::{BaselineCheck, check_latest_baseline};
 use crate::health::{AgentState, agent_health};
 use crate::output::{CmdResult, Output, Tone};
 
@@ -158,33 +159,91 @@ pub fn run(args: &VerifyArgs, global: &GlobalArgs, out: &Output) -> CmdResult {
     };
 
     if wanted(Component::Baseline) {
-        match &store {
-            Some(s) => match s.summary() {
-                Ok(sum) if sum.baseline_version.is_some() => checks.add(
-                    "baseline",
-                    "signature",
-                    CheckState::Skipped,
-                    "baseline signature verification arrives with milestone 2",
-                ),
-                Ok(_) => checks.add(
+        match (&store, &config) {
+            (Some(s), Some(cfg)) => match check_latest_baseline(s, cfg) {
+                Ok(BaselineCheck::None) => checks.add(
                     "baseline",
                     "established",
                     CheckState::Warn,
                     "no approved baseline; changes cannot be detected yet",
                 ),
-                Err(e) => checks.fail(
+                Ok(BaselineCheck::Verified { version }) => checks.add(
                     "baseline",
-                    "read",
-                    e.to_string(),
+                    "seal",
+                    CheckState::Pass,
+                    format!("baseline v{version} digest and signature verified"),
+                ),
+                Ok(BaselineCheck::Failed { version, problems }) => checks.fail(
+                    "baseline",
+                    "seal",
+                    format!("baseline v{version}: {}", problems.join("; ")),
                     ExitStatus::IntegrityFailure,
                 ),
+                Ok(BaselineCheck::Unverifiable { version, reason }) => checks.fail(
+                    "baseline",
+                    "seal",
+                    format!("baseline v{version} cannot be verified: {reason}"),
+                    ExitStatus::IntegrityFailure,
+                ),
+                Err(f) => checks.fail("baseline", "seal", f.message, f.status),
             },
-            None => checks.add(
+            _ => checks.add(
                 "baseline",
-                "established",
+                "seal",
                 CheckState::Skipped,
                 "database unavailable",
             ),
+        }
+        if let Some(s) = &store {
+            let open: i64 = s
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM coverage_gaps WHERE closed_at IS NULL",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or_default();
+            if open == 0 {
+                checks.add(
+                    "coverage",
+                    "gaps",
+                    CheckState::Pass,
+                    "no open coverage gaps",
+                );
+            } else {
+                let mut stmt = s
+                    .connection()
+                    .prepare(
+                        "SELECT kind, path, detail FROM coverage_gaps WHERE closed_at IS NULL
+                         ORDER BY opened_at DESC, id LIMIT 20",
+                    )
+                    .ok();
+                let rows: Vec<(String, Option<Vec<u8>>, String)> = stmt
+                    .as_mut()
+                    .and_then(|st| {
+                        st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                            .ok()
+                            .map(|it| it.filter_map(Result::ok).collect())
+                    })
+                    .unwrap_or_default();
+                checks.add(
+                    "coverage",
+                    "gaps",
+                    CheckState::Warn,
+                    format!("{open} open coverage gap(s)"),
+                );
+                for (kind, path, detail) in rows {
+                    let path = path
+                        .map(|p| String::from_utf8_lossy(&p).into_owned())
+                        .unwrap_or_default();
+                    checks.add(
+                        "coverage",
+                        kind,
+                        CheckState::Warn,
+                        format!("{path}: {detail}"),
+                    );
+                }
+            }
         }
     }
 

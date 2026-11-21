@@ -12,10 +12,11 @@ and program execution, and reports deviations and monitoring gaps locally.
 
 ## Status
 
-Milestone 1 (foundation) is in place: CLI, configuration validation, platform
-detection, SQLite schema and migrations, the daemon lifecycle and the systemd
-unit. Monitoring features arrive in the following milestones; commands that
-are not available yet say so and exit with code 7.
+Milestones 1 and 2 are in place: CLI, configuration validation, platform
+detection, SQLite storage, the daemon lifecycle and systemd unit, plus file
+inventory (classification, metadata, SHA-256), signed baselines and baseline
+comparison. Continuous monitoring arrives in the following milestones;
+commands that are not available yet say so and exit with code 7.
 
 ## Building
 
@@ -30,11 +31,12 @@ requirement besides Rust is a C compiler.
 ## Trying it without installing
 
 ```sh
-soteria config default | sed 's#/var/lib/soteria#/tmp/soteria#' > /tmp/soteria.toml
+soteria config default \
+  | sed 's#/var/lib/soteria#/tmp/soteria#; s#/etc/soteria/keys#/tmp/soteria/keys#' > /tmp/soteria.toml
 export SOTERIA_CONFIG=/tmp/soteria.toml
-soteria init
+sudo -E soteria init          # inventories, then asks you to approve the baseline
 soteria status
-soteria verify
+sudo -E soteria scan --baseline   # rescan and list deviations from the baseline
 ```
 
 ## Layout
@@ -45,6 +47,8 @@ soteria verify
 | `crates/soteria-config` | TOML configuration loading and validation |
 | `crates/soteria-platform` | OS detection and RHEL/Debian adapters |
 | `crates/soteria-store` | SQLite schema, migrations and storage |
+| `crates/soteria-inventory` | File discovery, classification, metadata and hashing |
+| `crates/soteria-integrity` | Scans, signed baselines and comparison |
 | `crates/soteria-cli` | The `soteria` binary (CLI and daemon) |
 | `packaging/config/soteria.toml` | Default `/etc/soteria/soteria.toml` |
 | `packaging/systemd/soteria.service` | Hardened systemd unit |

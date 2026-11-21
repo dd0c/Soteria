@@ -38,6 +38,13 @@ include = [
 ]
 exclude = ["/proc", "/sys", "/dev", "/run"]
 
+[baseline]
+# Ed25519 key pair that seals approved baselines, created by `soteria init`.
+# The signing key must be readable by root only; the daemon only reads the
+# public key.
+signing_key = "/etc/soteria/keys/baseline.key"
+public_key = "/etc/soteria/keys/baseline.pub"
+
 [alerts]
 # One of: critical, high, medium, low, info
 minimum_severity = "low"
