@@ -5,6 +5,9 @@
 # binary links against that release's glibc.
 
 %global selinuxtype targeted
+# The binary is built by cargo before rpmbuild; there are no sources to
+# extract debug information from.
+%global debug_package %{nil}
 
 Name:           soteria
 Version:        %{soteria_version}

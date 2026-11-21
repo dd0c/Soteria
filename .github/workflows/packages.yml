@@ -37,6 +37,8 @@ jobs:
             build: packaging/deb/build.sh
     container:
       image: ${{ matrix.image }}
+      # The daemon's two capabilities, which Docker leaves out by default.
+      options: --cap-add DAC_READ_SEARCH --cap-add AUDIT_READ
     steps:
       - name: Install build dependencies
         run: ${{ matrix.deps }}
